@@ -3,13 +3,16 @@
 """
 
 import json
-import os
+import logging
 import re
 
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 
-from agent_scraper.models import PageRules
+from agent_scraper.core.llm import create_openai_client, get_model_name
+from agent_scraper.core.models import PageRules
+
+logger = logging.getLogger(__name__)
 
 DISCOVER_PROMPT = """\
 你是一个网页结构分析专家。分析下面的 HTML 片段，**只**找出用户要求的遍历规则。
@@ -31,6 +34,7 @@ HTML 片段:
   "pagination_max": "（仅当用户要求 pagination 时）总页数，否则null",
   "sub_page_selector": "（仅当用户要求 sub_pages 时）子页面/文件夹链接的CSS选择器，否则null",
   "sub_page_url_attr": "子页面链接的URL属性，通常是href",
+  "sub_page_url_filter": "URL中必须包含的关键词（如'/tree/'），用于过滤掉文件链接，没有则null",
   "sub_page_recursive": false
 }}
 
@@ -38,20 +42,20 @@ CSS选择器要求:
 1. 尽量精确，能唯一定位到目标元素
 2. 用户没要求的模式，对应字段必须返回null
 3. 对于 load_more，优先用精确选择器；如果按钮没有 class/id，可以用文本匹配描述
+4. 对于 sub_pages，选择器必须**只匹配文件夹/目录链接**，不要匹配单个文件链接。
+   文件夹通常有文件夹图标(svg)、特殊class、或URL中包含 /tree/ 等标志。
+   如果无法区分文件夹和文件，在 sub_page_url_pattern 中说明过滤规则。
 
 只输出JSON。
 """
 
-MAX_HTML_SIZE = 50 * 1024
+MAX_HTML_SIZE = 50 * 1024  # 50KB — RuleDiscoverer 只需导航骨架，不需要完整内容
 
 
 class RuleDiscoverer:
     def __init__(self, client: AsyncOpenAI | None = None):
-        self.client = client or AsyncOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL"),
-        )
-        self.model = os.getenv("MODEL_NAME", "gpt-4o")
+        self.client = client or create_openai_client()
+        self.model = get_model_name()
 
     async def discover(
         self, html: str, current_url: str = "", traversal_hints: list[str] | None = None
@@ -61,10 +65,10 @@ class RuleDiscoverer:
         如果 hints 为空 → 直接返回空规则（单页模式，不调用 LLM）。
         """
         if not traversal_hints:
-            print("[RuleDiscoverer] 用户未要求遍历，单页模式")
+            logger.info("用户未要求遍历，单页模式")
             return PageRules()
 
-        print(f"[RuleDiscoverer] 用户要求: {traversal_hints}")
+        logger.info("用户要求: %s", traversal_hints)
         snippet = self._get_clean_snippet(html)
 
         prompt = DISCOVER_PROMPT.format(
@@ -101,6 +105,7 @@ class RuleDiscoverer:
             if "sub_pages" in traversal_hints:
                 filtered["sub_page_selector"] = data.get("sub_page_selector")
                 filtered["sub_page_url_attr"] = data.get("sub_page_url_attr", "href")
+                filtered["sub_page_url_filter"] = data.get("sub_page_url_filter")
                 filtered["sub_page_recursive"] = data.get("sub_page_recursive", False)
 
             rules = PageRules(**{k: v for k, v in filtered.items() if v is not None})
@@ -108,14 +113,23 @@ class RuleDiscoverer:
             return rules
 
         except Exception as e:
-            print(f"[RuleDiscoverer] 分析失败: {e}，返回空规则")
+            logger.error("分析失败: %s，返回空规则", e)
             return PageRules()
 
     @staticmethod
     def _get_clean_snippet(html: str) -> str:
+        """精简 HTML：去噪 + 压缩重复列表项，只保留导航骨架。"""
         soup = BeautifulSoup(html, "lxml")
-        for tag in soup.find_all(["script", "style", "noscript"]):
+
+        # 1. 去掉无用标签
+        for tag in soup.find_all(["script", "style", "noscript", "svg", "img", "picture", "video"]):
             tag.decompose()
+
+        # 2. 去掉内联样式和 data-* 属性（减少噪声）
+        for tag in soup.find_all(True):
+            remove_attrs = [a for a in tag.attrs if a.startswith("data-") or a == "style"]
+            for a in remove_attrs:
+                del tag[a]
 
         main = (
             soup.find("main")
@@ -126,9 +140,31 @@ class RuleDiscoverer:
             or soup
         )
 
+        # 3. 压缩重复列表项：如果 <ul>/<ol>/<tbody> 有 >5 个同类子项，只保留前3+后1
+        for container in main.find_all(["ul", "ol", "tbody", "div"]):
+            children = [c for c in container.children if hasattr(c, "name") and c.name]
+            if len(children) > 5:
+                # 检查子元素是否同质（同标签名）
+                tag_names = [c.name for c in children]
+                most_common = max(set(tag_names), key=tag_names.count)
+                same_tag = [c for c in children if c.name == most_common]
+                if len(same_tag) > 5:
+                    # 保留前3个 + 最后1个，中间替换为占位提示
+                    keep_head = same_tag[:3]
+                    keep_tail = [same_tag[-1]]
+                    removed_count = len(same_tag) - 4
+                    for item in same_tag:
+                        if item not in keep_head and item not in keep_tail:
+                            item.decompose()
+                    # 插入占位注释
+                    placeholder = soup.new_string(f"\n<!-- ... 省略 {removed_count} 个同类元素 ... -->\n")
+                    keep_head[-1].insert_after(placeholder)
+
         content = str(main)
         if len(content) > MAX_HTML_SIZE:
             content = content[:MAX_HTML_SIZE]
+
+        logger.info("HTML 精简: %.0fKB → %.0fKB", len(html)/1024, len(content)/1024)
         return content
 
     @staticmethod
@@ -144,8 +180,8 @@ class RuleDiscoverer:
             found.append(f"sub_pages: {rules.sub_page_selector} (recursive={rules.sub_page_recursive})")
 
         if found:
-            print(f"[RuleDiscoverer] 发现 {len(found)} 条规则:")
+            logger.info("发现 %d 条规则:", len(found))
             for r in found:
-                print(f"  - {r}")
+                logger.info("  - %s", r)
         else:
-            print("[RuleDiscoverer] 未找到匹配的遍历规则")
+            logger.info("未找到匹配的遍历规则")

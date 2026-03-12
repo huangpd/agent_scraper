@@ -3,10 +3,13 @@
 import csv
 import io
 import json
+import logging
 import re
 from urllib.parse import urljoin
 
-from agent_scraper.models import ExtractionGoal, ScrapedResult
+from agent_scraper.core.models import ExtractionGoal, ScrapedResult
+
+logger = logging.getLogger(__name__)
 
 
 class Formatter:
@@ -30,6 +33,12 @@ class Formatter:
         for i in range(count):
             record = {name: aligned[name][i] for name in field_names}
             records.append(record)
+
+        # 跨页面去重（多个页面可能提取到相同记录）
+        before = len(records)
+        records = self._dedup_records(records)
+        if len(records) < before:
+            logger.info("去重: %d → %d 条", before, len(records))
 
         # 自动从样本推断缺失的 URL 字段（如 download_url = prefix + file_name）
         if goal.samples and records:
@@ -87,8 +96,8 @@ class Formatter:
                     p == patterns[0] for p in patterns
                 ):
                     prefix, suffix = patterns[0]
-                    print(
-                        f"[Formatter] 自动推断: {field_name} = '{prefix}' + {other_field} + '{suffix}'"
+                    logger.info(
+                        "自动推断: %s = '%s' + %s + '%s'", field_name, prefix, other_field, suffix
                     )
                     for record in records:
                         if other_field in record:
@@ -96,6 +105,18 @@ class Formatter:
                     break
 
         return records
+
+    @staticmethod
+    def _dedup_records(records: list[dict]) -> list[dict]:
+        """跨页面去重，保持顺序"""
+        seen = set()
+        unique = []
+        for record in records:
+            key = tuple(sorted(record.items()))
+            if key not in seen:
+                seen.add(key)
+                unique.append(record)
+        return unique
 
     @staticmethod
     def _align_fields(raw_data: dict[str, list]) -> dict[str, list]:

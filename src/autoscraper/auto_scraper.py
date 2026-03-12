@@ -7,8 +7,11 @@ AutoScraper - ML Enhanced Drop-in Replacement
 
 import hashlib
 import json
+import logging
 import re
 from collections import defaultdict
+
+logger = logging.getLogger(__name__)
 from difflib import SequenceMatcher
 from html import unescape
 from urllib.parse import urljoin, urlparse
@@ -471,7 +474,7 @@ class AutoScraper(object):
 
         # ★ 核心改动②：规则结果为空且 sklearn 可用时，启动 ML 训练
         if not result_list and use_ml and _ML_AVAILABLE:
-            print("[AutoScraper] 规则模式未找到结果，切换到 ML 模式...")
+            logger.info("规则模式未找到结果，切换到 ML 模式...")
             self._ml_active = True
             self._ml_build(soup, url, _wanted_dict, text_fuzz_ratio)
             # 返回 ML 在训练页的回放结果
@@ -531,6 +534,7 @@ class AutoScraper(object):
         self._ml_classifiers = {}
         self._ml_vocabs = {}
         self._ml_n_positives = {}  # 记录每个 alias 的正样本数，用于单样本特殊处理
+        self._ml_wanted_dict = wanted_dict  # 保存原始样本，用于推断字段类型
 
         all_nodes = [n for n in soup.find_all(True) if n.name]
         all_features = [_extract_node_features(n, soup) for n in all_nodes]
@@ -539,16 +543,35 @@ class AutoScraper(object):
             targets = [normalize(t) for t in targets]
             seed_nodes = []  # 直接命中的种子节点
 
+            # 预处理：对 URL 类 target，提取 path 用于宽松匹配
+            target_paths = {}
+            for t in targets:
+                if t.startswith("http"):
+                    target_paths[t] = urlparse(t).path
+                elif t.startswith("/"):
+                    target_paths[t] = t
+
             for target in targets:
+                target_path = target_paths.get(target)
                 for i, node in enumerate(all_nodes):
                     text = node.get_text(strip=True)
                     hit = (SequenceMatcher(None, target, text).ratio() >= fuzz_ratio
                            if fuzz_ratio < 1.0 else text == target)
                     if not hit:
                         for val in node.attrs.values():
-                            if isinstance(val, str) and val.strip() == target:
-                                hit = True
-                                break
+                            if isinstance(val, str):
+                                val_s = val.strip()
+                                # 精确匹配
+                                if val_s == target:
+                                    hit = True
+                                    break
+                                # URL 宽松匹配：full URL target vs 相对路径属性值
+                                if target_path and (
+                                    val_s == target_path
+                                    or val_s.rstrip("/") == target_path.rstrip("/")
+                                ):
+                                    hit = True
+                                    break
                     if hit:
                         # 只保留最小节点
                         is_anc = any(
@@ -558,7 +581,7 @@ class AutoScraper(object):
                             seed_nodes.append(node)
 
             if not seed_nodes:
-                print(f"[ML] alias='{alias}' 未找到正样本，跳过")
+                logger.warning("alias='%s' 未找到正样本，跳过", alias)
                 continue
 
             # ★ 列表页关键：把结构相同的所有兄弟节点都标为正样本
@@ -569,9 +592,10 @@ class AutoScraper(object):
                 if sn in all_nodes:
                     positive_indices.add(all_nodes.index(sn))
 
-            print(f"[ML] alias='{alias}' 训练中，"
-                  f"{len(seed_nodes)} 个种子 → 扩充到 {len(positive_indices)} 个正样本 "
-                  f"/ {len(all_nodes)} 个节点")
+            logger.info(
+                "alias='%s' 训练中，%d 个种子 → 扩充到 %d 个正样本 / %d 个节点",
+                alias, len(seed_nodes), len(positive_indices), len(all_nodes),
+            )
 
             vocab = None
             vecs = []
@@ -626,14 +650,76 @@ class AutoScraper(object):
 
             hit_nodes = [all_nodes[i] for i in hit_indices]
 
-            # 去除父子重复：只保留最小子节点
-            def is_ancestor_hit(node):
-                return any(node in list(h.parents) for h in hit_nodes if h != node)
+            # 判断该 alias 是否为 URL 字段
+            is_url_field = False
+            if hasattr(self, '_ml_wanted_dict') and alias in self._ml_wanted_dict:
+                samples = self._ml_wanted_dict[alias]
+                is_url_field = any(
+                    s.startswith("http") or s.startswith("/") for s in samples
+                )
+
+            def _node_text(node):
+                """节点的直接文本内容（用于去重判断）"""
+                from autoscraper.utils import get_non_rec_text
+                return get_non_rec_text(node) or node.get_text(strip=True)
+
+            def _extract_val(node):
+                """从节点提取最终值（含属性回退）"""
+                if is_url_field:
+                    val = (node.get("href")
+                           or node.get("src")
+                           or node.get("data-src"))
+                    if val:
+                        return val
+                # 直接文本
+                from autoscraper.utils import get_non_rec_text
+                val = get_non_rec_text(node)
+                if val:
+                    return val
+                # 含子节点的完整文本
+                val = node.get_text(strip=True)
+                if val:
+                    return val
+                # 回退：常见属性
+                for attr in ("title", "aria-label", "alt", "data-name"):
+                    val = node.get(attr, "")
+                    if val and isinstance(val, str):
+                        return val.strip()
+                return ""
+
+            # 去重策略：基于直接文本判断父子保留关系
+            # 1) 有直接文本的节点优先保留
+            # 2) 祖先有直接文本 而 子节点没有 → 保留祖先
+            # 3) 都有或都没有 → 保留子节点（原行为）
+            hit_with_text = []
+            for i in hit_indices:
+                node = all_nodes[i]
+                text = _node_text(node)
+                hit_with_text.append((i, node, text))
+
+            removed = set()
+            for idx_a, node_a, text_a in hit_with_text:
+                if idx_a in removed:
+                    continue
+                for idx_b, node_b, text_b in hit_with_text:
+                    if idx_b in removed or idx_a == idx_b:
+                        continue
+                    # 检查 node_a 是否为 node_b 的祖先
+                    if any(id(p) == id(node_a) for p in node_b.parents):
+                        # node_a 是祖先，node_b 是子节点
+                        if text_b and text_a:
+                            removed.add(idx_a)  # 都有文本：保留子节点
+                        elif text_a and not text_b:
+                            removed.add(idx_b)  # 只有祖先有文本：保留祖先
+                        elif text_b and not text_a:
+                            removed.add(idx_a)  # 只有子节点有文本：保留子节点
+                        else:
+                            removed.add(idx_a)  # 都没有文本：保留子节点
 
             leaf_hits = [
                 (all_nodes[i], proba[i][pos_idx])
                 for i in hit_indices
-                if not is_ancestor_hit(all_nodes[i])
+                if i not in removed
             ]
 
             # 按 DOM 顺序排列
@@ -642,10 +728,10 @@ class AutoScraper(object):
             seen = set()
             alias_results[alias] = []
             for node, _ in leaf_hits:
-                text = node.get_text(strip=True)
-                if text and text not in seen:
-                    seen.add(text)
-                    alias_results[alias].append(text)
+                val = _extract_val(node)
+                if val and val not in seen:
+                    seen.add(val)
+                    alias_results[alias].append(val)
 
         if group_by_alias:
             return alias_results
@@ -716,4 +802,4 @@ class AutoScraper(object):
             id_to_stack[rule_id]["alias"] = alias
 
     def generate_python_code(self):
-        print("This function is deprecated. Please use save() and load() instead.")
+        logger.warning("This function is deprecated. Please use save() and load() instead.")

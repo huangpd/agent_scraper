@@ -5,9 +5,13 @@
 
 import asyncio
 import json as json_mod
-from urllib.parse import urljoin
+import logging
+import re
+from urllib.parse import urljoin, urlparse
 
-from agent_scraper.models import PageRules
+from agent_scraper.core.models import PageRules
+
+logger = logging.getLogger(__name__)
 
 
 class PageIterator:
@@ -55,6 +59,7 @@ class PageIterator:
             sub_htmls = await self._do_sub_pages(
                 selector=rules.sub_page_selector,
                 url_attr=rules.sub_page_url_attr,
+                url_filter=rules.sub_page_url_filter,
                 load_more_selector=rules.load_more_selector,
                 base_url=base_url,
             )
@@ -74,7 +79,7 @@ class PageIterator:
         else:
             htmls.append(first_html)
 
-        print(f"[PageIterator] 共收集 {len(htmls)} 个页面的 HTML")
+        logger.info("共收集 %d 个页面的 HTML", len(htmls))
         return htmls
 
     # ── load_more ────────────────────────────────────────
@@ -89,10 +94,10 @@ class PageIterator:
                 break
             click_count += 1
             if click_count % 5 == 0:
-                print(f"  [PageIterator] load_more 已点击 {click_count} 次...")
+                logger.info("load_more 已点击 %d 次...", click_count)
             await asyncio.sleep(1.5)
         if click_count > 0:
-            print(f"  [PageIterator] load_more 完成，共点击 {click_count} 次")
+            logger.info("load_more 完成，共点击 %d 次", click_count)
 
     @staticmethod
     def _build_load_more_js(selector: str | None) -> str:
@@ -130,8 +135,9 @@ class PageIterator:
         self,
         selector: str,
         url_attr: str,
-        load_more_selector: str | None,
-        base_url: str,
+        url_filter: str | None = None,
+        load_more_selector: str | None = None,
+        base_url: str = "",
         visited: set | None = None,
         depth: int = 0,
         max_depth: int = 5,
@@ -141,7 +147,7 @@ class PageIterator:
             visited = set()
 
         if depth >= max_depth:
-            print(f"  [PageIterator] 达到最大递归深度 {max_depth}，停止")
+            logger.warning("达到最大递归深度 %d，停止", max_depth)
             return []
 
         indent = "  " * (depth + 1)
@@ -150,15 +156,30 @@ class PageIterator:
         urls = await self._extract_links(selector, url_attr, base_url)
         urls = [u for u in urls if u not in visited]
 
+        # 应用 URL 过滤
+        if url_filter:
+            before = len(urls)
+            urls = [u for u in urls if url_filter in u]
+            filtered_out = before - len(urls)
+            if filtered_out:
+                logger.info("URL 过滤 '%s': %d → %d (排除 %d)", url_filter, before, len(urls), filtered_out)
+        else:
+            # 通用兜底：排除明显的文件链接（含 /blob/、/raw/ 或常见文件扩展名）
+            before = len(urls)
+            urls = [u for u in urls if not self._is_file_url(u)]
+            filtered_out = before - len(urls)
+            if filtered_out:
+                logger.info("自动排除 %d 个文件链接", filtered_out)
+
         if not urls:
             return []
 
-        print(f"{indent}[PageIterator] 发现 {len(urls)} 个子页面 (depth={depth})")
+        logger.info("发现 %d 个子页面 (depth=%d)", len(urls), depth)
 
         htmls = []
         for i, url in enumerate(urls):
             visited.add(url)
-            print(f"{indent}[PageIterator] 进入子页面 [{i + 1}/{len(urls)}]: {url}")
+            logger.info("进入子页面 [%d/%d]: %s", i + 1, len(urls), url)
             try:
                 await self._goto(url)
 
@@ -172,6 +193,7 @@ class PageIterator:
                 deeper = await self._do_sub_pages(
                     selector=selector,
                     url_attr=url_attr,
+                    url_filter=url_filter,
                     load_more_selector=load_more_selector,
                     base_url=url,
                     visited=visited,
@@ -181,9 +203,35 @@ class PageIterator:
                 htmls.extend(deeper)
 
             except Exception as e:
-                print(f"{indent}[PageIterator] 子页面 [{i + 1}] 失败: {e}")
+                logger.error("子页面 [%d] 失败: %s", i + 1, e)
 
         return htmls
+
+    # 常见文件扩展名
+    _FILE_EXTENSIONS = re.compile(
+        r'\.(md|txt|json|jsonl|csv|tsv|xml|yaml|yml|toml|cfg|ini|conf|log'
+        r'|py|js|ts|java|c|cpp|h|go|rs|rb|php|sh|bat|ps1'
+        r'|html|css|scss|less'
+        r'|png|jpg|jpeg|gif|svg|ico|webp|bmp'
+        r'|pdf|doc|docx|xls|xlsx|ppt|pptx'
+        r'|zip|tar|gz|bz2|7z|rar'
+        r'|bin|exe|dll|so|dylib|whl|safetensors|gguf|pt|onnx'
+        r'|gitattributes|gitignore|gitmodules|dockerignore|editorconfig)$',
+        re.I,
+    )
+
+    # 已知文件路径模式（如 HuggingFace /blob/、GitHub /blob/）
+    _FILE_PATH_PATTERNS = re.compile(r'/blob/|/raw/')
+
+    @classmethod
+    def _is_file_url(cls, url: str) -> bool:
+        """判断 URL 是否指向单个文件而非目录/页面"""
+        path = urlparse(url).path
+        if cls._FILE_PATH_PATTERNS.search(path):
+            return True
+        if cls._FILE_EXTENSIONS.search(path):
+            return True
+        return False
 
     async def _extract_links(self, selector: str, url_attr: str, base_url: str) -> list[str]:
         """从当前页面提取子页面链接"""
@@ -220,7 +268,7 @@ class PageIterator:
     # ── pagination URL ───────────────────────────────────
 
     async def _do_pagination_url(self, url_pattern: str, max_pages: int) -> list[str]:
-        print(f"  [PageIterator] URL 分页: max={max_pages}")
+        logger.info("URL 分页: max=%d", max_pages)
         htmls = []
         for n in range(2, max_pages + 1):
             url = url_pattern.replace("{n}", str(n))
@@ -228,20 +276,20 @@ class PageIterator:
                 await self._goto(url)
                 html = await self._get_html()
                 if len(html) < 1000:
-                    print(f"  [PageIterator] 第 {n} 页内容过少，停止")
+                    logger.info("第 %d 页内容过少，停止", n)
                     break
                 htmls.append(html)
                 if n % 5 == 0:
-                    print(f"  [PageIterator] 已完成 {n} 页...")
+                    logger.info("已完成 %d 页...", n)
             except Exception as e:
-                print(f"  [PageIterator] 分页 {n} 失败: {e}，停止")
+                logger.error("分页 %d 失败: %s，停止", n, e)
                 break
         return htmls
 
     # ── next_button ──────────────────────────────────────
 
     async def _do_next_button(self, selector: str) -> list[str]:
-        print(f"  [PageIterator] 翻页按钮: {selector}")
+        logger.info("翻页按钮: %s", selector)
         safe_sel = selector.replace("'", "\\'")
         htmls = []
         for i in range(100):
@@ -257,6 +305,6 @@ class PageIterator:
             await asyncio.sleep(2)
             htmls.append(await self._get_html())
             if (i + 1) % 5 == 0:
-                print(f"  [PageIterator] 已翻 {i + 1} 页...")
-        print(f"  [PageIterator] 翻页完成，共 {len(htmls)} 个额外页面")
+                logger.info("已翻 %d 页...", i + 1)
+        logger.info("翻页完成，共 %d 个额外页面", len(htmls))
         return htmls

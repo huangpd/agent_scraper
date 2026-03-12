@@ -1,21 +1,23 @@
 """LLM 解析自然语言指令 → 结构化 ParsedTask"""
 
 import json
-import os
 import re
 from collections import defaultdict
 
 from openai import AsyncOpenAI
 
-from agent_scraper.models import ExtractionGoal, NavigationStep, ParsedTask
+from agent_scraper.core.llm import create_openai_client, get_model_name
+
+from agent_scraper.core.models import ExtractionGoal, NavigationStep, ParsedTask
 
 PARSE_PROMPT = """\
 你是一个任务解析器。将用户的自然语言爬取指令解析为结构化JSON。
 
 输出格式（严格JSON，不要多余文字）：
 {{
+  "mode": "extract|capture",
   "navigation_steps": [
-    {{"action": "goto|click|wait", "target": "URL或按钮文本或选择器", "description": "原始描述"}}
+    {{"action": "goto|click|wait|input", "target": "URL或按钮文本或选择器", "value": "input时填入的值，其他为空字符串", "description": "原始描述"}}
   ],
   "extraction_goal": {{
     "fields": {{"字段名": "字段描述", ...}},
@@ -25,10 +27,22 @@ PARSE_PROMPT = """\
   }}
 }}
 
+mode 说明（二选一）：
+- "extract": 从页面HTML中**批量提取**结构化数据（列表、表格等多条记录）。适用于：文件列表、商品列表、搜索结果等
+- "capture": 通过浏览器操作**直接捕获**少量特定值（1-3个），不需要HTML解析。适用于：获取下载链接、复制当前URL、抓取某个特定元素的值等
+  - 当用户说"复制URL"、"获取链接"、"保存/记录某个值"、"capture"等，使用 capture
+  - 当任务核心是浏览器操作（登录→点击→获取结果），且不需要批量提取时，使用 capture
+
 navigation_steps 的 action 只包含需要AI理解的操作:
 - goto: 打开URL
 - click: 点击某个元素
 - wait: 等待页面加载
+- input: 在输入框中填写内容（target 为输入框描述，value 为要填入的值）
+
+对于登录/表单场景，将每次输入和点击拆分为独立步骤，例如：
+  {{"action": "input", "target": "邮箱输入框", "value": "user@example.com", "description": "输入邮箱"}}
+  {{"action": "input", "target": "密码输入框", "value": "mypassword", "description": "输入密码"}}
+  {{"action": "click", "target": "Sign in", "description": "点击登录"}}
 
 traversal_hints 从用户指令中识别遍历意图（数组，可多选）:
 - "load_more": 用户提到"加载更多"、"Load more"、"全部加载"等
@@ -51,11 +65,8 @@ traversal_hints 从用户指令中识别遍历意图（数组，可多选）:
 
 class TaskParser:
     def __init__(self, client: AsyncOpenAI | None = None):
-        self.client = client or AsyncOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL"),
-        )
-        self.model = os.getenv("MODEL_NAME", "gpt-4o")
+        self.client = client or create_openai_client()
+        self.model = get_model_name()
 
     async def parse(self, instruction: str) -> ParsedTask:
         # 先提取用户提供的样本数据
@@ -83,6 +94,10 @@ class TaskParser:
         hints = goal_data.get("traversal_hints", [])
         hints = self._ensure_traversal_hints(hints, instruction)
 
+        # LLM 识别模式 + 关键词兜底
+        mode = data.get("mode", "extract")
+        mode = self._ensure_mode(mode, instruction)
+
         goal = ExtractionGoal(
             fields=goal_data["fields"],
             output_format=goal_data.get("output_format", "json"),
@@ -95,6 +110,7 @@ class TaskParser:
             navigation_steps=steps,
             extraction_goal=goal,
             raw_instruction=instruction,
+            mode=mode,
         )
 
     @staticmethod
@@ -113,24 +129,55 @@ class TaskParser:
         return hints
 
     @staticmethod
+    def _ensure_mode(mode: str, instruction: str) -> str:
+        """关键词兜底：检测 capture 模式"""
+        if mode == "capture":
+            return mode
+        text = instruction.lower()
+        capture_keywords = [
+            "复制url", "copy_url", "copy url", "获取链接", "获取下载链接",
+            "捕获", "capture", "保存链接", "记录链接", "抓取链接",
+            "获取当前url", "获取当前页面url",
+        ]
+        if any(kw in text for kw in capture_keywords):
+            return "capture"
+        return mode
+
+    @staticmethod
     def _extract_samples(instruction: str) -> dict[str, list[str]] | None:
-        """从指令中提取用户提供的 JSONL 样本数据"""
-        json_lines = []
+        """从指令中提取用户提供的 JSONL 样本数据。
+        支持两种格式：
+        1. 每行一个 JSON 对象（标准 JSONL）
+        2. 连续的 JSON 对象（无换行分隔，如 textarea 单行输入）
+        """
+        json_objects = []
+
+        # 方式1: 按行匹配 JSON 对象
         for line in instruction.strip().splitlines():
             line = line.strip()
             if line.startswith("{") and line.endswith("}"):
                 try:
                     obj = json.loads(line)
                     if isinstance(obj, dict):
-                        json_lines.append(obj)
+                        json_objects.append(obj)
                 except json.JSONDecodeError:
                     continue
 
-        if not json_lines:
+        # 方式2: 如果按行没找到，用正则从整段文本中提取所有 {...} 对象
+        if not json_objects:
+            for m in re.finditer(r'\{[^{}]+\}', instruction):
+                try:
+                    obj = json.loads(m.group())
+                    if isinstance(obj, dict) and len(obj) >= 2:
+                        json_objects.append(obj)
+                except json.JSONDecodeError:
+                    continue
+
+        if not json_objects:
             return None
 
         samples = defaultdict(list)
-        for obj in json_lines:
+        for obj in json_objects:
             for key, value in obj.items():
                 samples[key].append(str(value))
 

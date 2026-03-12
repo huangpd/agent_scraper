@@ -2,3 +2,22 @@ __pycache__/
 *.pyc
 .env
 *.json
+
+# Virtual environment
+.venv/
+
+# IDE
+.idea/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/

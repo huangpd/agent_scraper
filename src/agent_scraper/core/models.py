@@ -5,9 +5,10 @@ from pydantic import BaseModel
 
 class NavigationStep(BaseModel):
     """单个导航步骤"""
-    action: str          # "goto" | "click" | "wait" | "click_until_gone" | "scroll"
-    target: str          # URL / 按钮文本 / CSS选择器
-    description: str     # 原始自然语言描述
+    action: str          # "goto" | "click" | "wait" | "input" | "scroll"
+    target: str = ""     # URL / 按钮文本 / CSS选择器（wait 时可为空）
+    value: str = ""      # input 动作的输入值（账号、密码等）
+    description: str = ""  # 原始自然语言描述
 
 
 class ExtractionGoal(BaseModel):
@@ -30,6 +31,7 @@ class PageRules(BaseModel):
     pagination_max: int | None = None         # 最大页数
     sub_page_selector: str | None = None      # "a.folder-link" 子页面入口
     sub_page_url_attr: str = "href"           # 从哪个属性取URL
+    sub_page_url_filter: str | None = None    # URL 过滤关键词，如 "/tree/" 只保留含此的URL
     sub_page_recursive: bool = False          # 是否递归进入子页面的子页面
 
 
@@ -38,6 +40,7 @@ class ParsedTask(BaseModel):
     navigation_steps: list[NavigationStep]
     extraction_goal: ExtractionGoal
     raw_instruction: str
+    mode: str = "extract"  # "extract": 批量提取 | "capture": 浏览器直接捕获值
 
 
 class ScrapedResult(BaseModel):
