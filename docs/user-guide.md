@@ -166,7 +166,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from agent_scraper import AgentScraper
-from agent_scraper.formatter import Formatter
+from agent_scraper.extraction.formatter import Formatter
 
 async def main():
     scraper = AgentScraper(headless=False)  # headless=True 隐藏浏览器
@@ -199,9 +199,21 @@ python run_server.py --prod
 
 在 Web UI 中：
 1. 在文本框中输入自然语言指令
-2. 点击"开始"按钮
-3. 实时查看执行日志
-4. 任务完成后查看/下载结果
+2. （可选）上传参考截图：点击上传按钮或 Ctrl+V 粘贴截图，用红框标注目标元素
+3. 点击"开始"按钮
+4. 实时查看执行日志
+5. 任务完成后查看/下载结果
+
+### 4.4 图片参考功能
+
+当目标页面的元素不容易用文字描述（如特定位置的按钮、图标等），可以：
+
+1. 截取目标页面的截图
+2. 用红色方框标注要操作的目标元素
+3. 在 Web UI 中上传截图（支持拖拽、点击上传或 Ctrl+V 粘贴）
+4. 系统会将截图传递给 AI Agent，帮助其精准定位元素
+
+截图会被自动转为 base64 编码，通过多模态 LLM 进行视觉理解。
 
 ### 4.3 REST API
 
@@ -209,8 +221,9 @@ python run_server.py --prod
 # 创建任务
 curl -X POST http://localhost:8000/api/tasks \
   -H "Content-Type: application/json" \
-  -d '{"instruction": "你的指令...", "headless": true}'
+  -d '{"instruction": "你的指令...", "headless": true, "images": []}'
 # 返回: {"task_id": "abc12345"}
+# images 可传入 base64 data URL 数组（可选）
 
 # 查询状态
 curl http://localhost:8000/api/tasks/abc12345

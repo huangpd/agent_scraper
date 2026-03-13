@@ -50,19 +50,27 @@ MODEL_NAME=gpt-4o
 
 ```
 src/
-├── agent_scraper/       # 核心库（可独立使用）
-│   ├── models.py        # 数据模型 → 修改字段/新增模型从这里开始
-│   ├── orchestrator.py  # Pipeline 编排 → 调整步骤顺序/新增步骤
-│   ├── task_parser.py   # 指令解析 → 修改 Prompt / 新增 action 类型
-│   ├── navigator.py     # 浏览器导航 → 修改 Agent 行为
-│   ├── rule_discoverer.py # 规则发现 → 新增遍历模式
-│   ├── page_iterator.py # 页面遍历 → 新增遍历执行逻辑
-│   ├── extractor.py     # 数据提取 → 调整降级策略/Prompt
-│   ├── formatter.py     # 输出格式化 → 新增输出格式
-│   └── autoscraper/     # ML 引擎 → 一般不需要修改
-└── server/              # Web 层（依赖 agent_scraper）
-    ├── app.py           # API 路由 → 新增接口
-    └── task_manager.py  # 任务管理 → 修改任务生命周期
+├── agent_scraper/              # 核心库（按职责分层）
+│   ├── __init__.py             # 公共 API → 外部只需 from agent_scraper import AgentScraper
+│   ├── core/                   # 基础层
+│   │   ├── models.py           # 数据模型 → 修改字段/新增模型从这里开始
+│   │   └── llm.py              # LLM 客户端工厂 → 修改 API 配置
+│   ├── pipeline/               # 编排层
+│   │   ├── orchestrator.py     # Pipeline 编排 → 调整步骤顺序/新增步骤
+│   │   └── task_parser.py      # 指令解析 → 修改 Prompt / 新增 action 类型
+│   ├── browser/                # 浏览器层
+│   │   ├── navigator.py        # 浏览器导航 + 图片参考 → 修改 Agent 行为
+│   │   └── page_iterator.py    # 页面遍历 → 新增遍历执行逻辑
+│   └── extraction/             # 提取层
+│       ├── rule_discoverer.py  # 规则发现 → 新增遍历模式
+│       ├── extractor.py        # 数据提取 → 调整降级策略/Prompt
+│       └── formatter.py        # 输出格式化 → 新增输出格式
+├── autoscraper/                # ML 引擎（独立包）→ 一般不需要修改
+│   ├── auto_scraper.py
+│   └── utils.py
+└── server/                     # Web 层（依赖 agent_scraper）
+    ├── app.py                  # API 路由 → 新增接口
+    └── task_manager.py         # 任务管理 → 修改任务生命周期
 ```
 
 ## 3. 开发指南
@@ -123,7 +131,7 @@ ruff format src/ tests/
 
 例如新增 "infinite_scroll"（无限滚动）：
 
-**步骤 1**：`models.py` — 在 `PageRules` 中添加字段
+**步骤 1**：`core/models.py` — 在 `PageRules` 中添加字段
 
 ```python
 class PageRules(BaseModel):
@@ -131,7 +139,7 @@ class PageRules(BaseModel):
     infinite_scroll: bool = False  # 是否无限滚动加载
 ```
 
-**步骤 2**：`task_parser.py` — 更新 `_ensure_traversal_hints`
+**步骤 2**：`pipeline/task_parser.py` — 更新 `_ensure_traversal_hints`
 
 ```python
 checks = {
@@ -140,9 +148,9 @@ checks = {
 }
 ```
 
-**步骤 3**：`rule_discoverer.py` — 更新 Prompt 和过滤逻辑
+**步骤 3**：`extraction/rule_discoverer.py` — 更新 Prompt 和过滤逻辑
 
-**步骤 4**：`page_iterator.py` — 在 `iterate()` 中添加执行逻辑
+**步骤 4**：`browser/page_iterator.py` — 在 `iterate()` 中添加执行逻辑
 
 **步骤 5**：添加测试
 
@@ -150,9 +158,9 @@ checks = {
 
 例如新增 Excel 输出：
 
-**步骤 1**：`formatter.py` — 添加 `to_excel()` 静态方法
+**步骤 1**：`extraction/formatter.py` — 添加 `to_excel()` 静态方法
 
-**步骤 2**：`models.py` — `ExtractionGoal.output_format` 增加可选值
+**步骤 2**：`core/models.py` — `ExtractionGoal.output_format` 增加可选值
 
 ### 4.3 修改 LLM Prompt
 
@@ -160,10 +168,12 @@ checks = {
 
 | Prompt | 文件 | 用途 |
 |--------|------|------|
-| `PARSE_PROMPT` | `task_parser.py` | 解析自然语言指令 |
-| `DISCOVER_PROMPT` | `rule_discoverer.py` | 发现页面遍历规则 |
-| `SAMPLE_PROMPT` | `extractor.py` | LLM 采样生成样本 |
-| `CSS_SELECTOR_PROMPT` | `extractor.py` | 生成 CSS 选择器 |
+| `PARSE_PROMPT` | `pipeline/task_parser.py` | 解析自然语言指令 |
+| `DISCOVER_PROMPT` | `extraction/rule_discoverer.py` | 发现页面遍历规则 |
+| `SAMPLE_PROMPT` | `extraction/extractor.py` | LLM 采样生成样本 |
+| `CSS_SELECTOR_PROMPT` | `extraction/extractor.py` | 生成 CSS 选择器 |
+| `_IMAGE_HINT` | `browser/navigator.py` | 图片参考定位提示 |
+| `_capture_suffix` | `browser/navigator.py` | Capture 模式字段捕获指令 |
 
 修改 Prompt 时注意：
 - 保持 JSON 输出格式不变（下游解析依赖固定格式）
@@ -187,11 +197,12 @@ async def list_tasks():
 
 ### 5.1 查看 LLM 交互
 
-每个 LLM 调用的输入输出都通过 `print()` 记录，运行时可在终端直接看到：
-- `[TaskParser]`：指令解析结果
-- `[RuleDiscoverer]`：发现的规则详情
-- `[Extractor]`：提取策略和各步骤结果
-- `[PageIterator]`：遍历进度
+各模块通过 `logging` 模块记录日志，运行时可在终端直接看到：
+- `agent_scraper.pipeline.task_parser`：指令解析结果
+- `agent_scraper.extraction.rule_discoverer`：发现的规则详情
+- `agent_scraper.extraction.extractor`：提取策略和各步骤结果
+- `agent_scraper.browser.page_iterator`：遍历进度
+- `agent_scraper.browser.navigator`：Agent 任务文本和捕获结果
 
 ### 5.2 headless 模式切换
 
@@ -205,4 +216,4 @@ scraper = AgentScraper(headless=True)
 
 ### 5.3 HTML 片段截取
 
-`Extractor` 和 `RuleDiscoverer` 都有 50KB 的 HTML 截取上限（`MAX_HTML_SIZE`）。如果目标页面主内容超过此限制，可调大此值，但要注意 LLM 上下文窗口限制。
+`Extractor` 和 `RuleDiscoverer` 都有 HTML 截取上限（`MAX_HTML_SIZE`）。如果目标页面主内容超过此限制，可调大此值，但要注意 LLM 上下文窗口限制。
