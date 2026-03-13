@@ -10,6 +10,28 @@ if "browser_use" not in sys.modules:
     browser_use_mock = MagicMock()
     sys.modules["browser_use"] = browser_use_mock
     sys.modules["browser_use.llm"] = browser_use_mock.llm
+    # browser_use.llm.messages 需要提供真实的 Pydantic model
+    from pydantic import BaseModel
+    from typing import Literal
+
+    class ImageURL(BaseModel):
+        url: str
+        detail: str = "auto"
+        media_type: str = "image"
+
+    class ContentPartTextParam(BaseModel):
+        text: str
+        type: Literal["text"] = "text"
+
+    class ContentPartImageParam(BaseModel):
+        image_url: ImageURL
+        type: Literal["image_url"] = "image_url"
+
+    messages_mock = MagicMock()
+    messages_mock.ContentPartTextParam = ContentPartTextParam
+    messages_mock.ContentPartImageParam = ContentPartImageParam
+    messages_mock.ImageURL = ImageURL
+    sys.modules["browser_use.llm.messages"] = messages_mock
 
 from agent_scraper.browser.navigator import Navigator, NavigateResult, CaptureResult
 from agent_scraper.core.models import NavigationStep
@@ -91,13 +113,13 @@ class TestConvertImages:
         parts = Navigator._convert_images([FAKE_DATA_URL])
         assert len(parts) == 2
         # 第一个是文字说明
-        assert parts[0]["type"] == "text"
-        assert "参考截图 1" in parts[0]["text"]
-        assert "红色方框" in parts[0]["text"]
+        assert parts[0].type == "text"
+        assert "参考截图 1" in parts[0].text
+        assert "红色方框" in parts[0].text
         # 第二个是图片
-        assert parts[1]["type"] == "image_url"
-        assert parts[1]["image_url"]["url"] == FAKE_DATA_URL
-        assert parts[1]["image_url"]["detail"] == "high"
+        assert parts[1].type == "image_url"
+        assert parts[1].image_url.url == FAKE_DATA_URL
+        assert parts[1].image_url.detail == "high"
 
     def test_multiple_images(self):
         urls = [f"data:image/png;base64,img{i}" for i in range(3)]
@@ -105,13 +127,13 @@ class TestConvertImages:
         # 每张图 2 个 part（文字 + 图片）
         assert len(parts) == 6
         # 编号递增
-        assert "参考截图 1" in parts[0]["text"]
-        assert "参考截图 2" in parts[2]["text"]
-        assert "参考截图 3" in parts[4]["text"]
+        assert "参考截图 1" in parts[0].text
+        assert "参考截图 2" in parts[2].text
+        assert "参考截图 3" in parts[4].text
         # 图片 URL 正确
-        assert parts[1]["image_url"]["url"] == urls[0]
-        assert parts[3]["image_url"]["url"] == urls[1]
-        assert parts[5]["image_url"]["url"] == urls[2]
+        assert parts[1].image_url.url == urls[0]
+        assert parts[3].image_url.url == urls[1]
+        assert parts[5].image_url.url == urls[2]
 
 
 class TestImagePassedToAgent:
@@ -145,7 +167,7 @@ class TestImagePassedToAgent:
         passed_images = call_kwargs.kwargs.get("sample_images") or call_kwargs[1].get("sample_images")
         assert passed_images is not None
         assert len(passed_images) == 2  # 1 text + 1 image_url
-        assert passed_images[1]["image_url"]["url"] == FAKE_DATA_URL
+        assert passed_images[1].image_url.url == FAKE_DATA_URL
 
         # task_text 应包含图片提示
         task_text = call_kwargs.kwargs.get("task") or call_kwargs[0][0] if call_kwargs[0] else call_kwargs.kwargs["task"]
@@ -208,8 +230,8 @@ class TestImagePassedToAgent:
         call_kwargs = mock_agent_cls.call_args
         passed_images = call_kwargs.kwargs.get("sample_images") or call_kwargs[1].get("sample_images")
         assert len(passed_images) == 4  # 2 images × 2 parts each
-        assert "参考截图 1" in passed_images[0]["text"]
-        assert "参考截图 2" in passed_images[2]["text"]
+        assert "参考截图 1" in passed_images[0].text
+        assert "参考截图 2" in passed_images[2].text
 
         task_text = call_kwargs.kwargs.get("task") or call_kwargs.kwargs["task"]
         assert "参考截图" in task_text

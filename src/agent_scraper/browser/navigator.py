@@ -11,6 +11,7 @@ import re
 
 from browser_use import Agent, Browser, BrowserProfile
 from browser_use.llm import ChatOpenAI
+from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL
 
 from agent_scraper.core.llm import get_model_name
 from agent_scraper.core.models import NavigationStep
@@ -42,20 +43,20 @@ class Navigator:
         self.headless = headless
 
     @staticmethod
-    def _convert_images(images: list[str] | None) -> list[dict]:
-        """将 base64 data URL 列表转为 OpenAI ContentPartImageParam 格式。"""
+    def _convert_images(
+        images: list[str] | None,
+    ) -> list[ContentPartTextParam | ContentPartImageParam]:
+        """将 base64 data URL 列表转为 browser_use 的 ContentPart 类型。"""
         if not images:
             return []
-        parts: list[dict] = []
+        parts: list[ContentPartTextParam | ContentPartImageParam] = []
         for i, data_url in enumerate(images):
-            parts.append({
-                "type": "text",
-                "text": f"[参考截图 {i+1}] 红色方框标注的是用户要操作的目标元素位置:",
-            })
-            parts.append({
-                "type": "image_url",
-                "image_url": {"url": data_url, "detail": "high"},
-            })
+            parts.append(ContentPartTextParam(
+                text=f"[参考截图 {i+1}] 红色方框标注的是用户要操作的目标元素位置:",
+            ))
+            parts.append(ContentPartImageParam(
+                image_url=ImageURL(url=data_url, detail="high"),
+            ))
         return parts
 
     def _create_browser(self) -> Browser:

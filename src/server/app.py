@@ -108,18 +108,22 @@ async def create_task(req: CreateTaskRequest):
         old_stdout = sys.stdout
         sys.stdout = capture
 
-        # 2) logging 拦截：所有 logging 日志 → PrintCapture → 终端+WebSocket
+        # 2) logging 拦截：劫持所有已有 StreamHandler 的输出流 → PrintCapture
         #    browser-use 等库在导入时就注册了自己的 StreamHandler（指向原始 stdout/stderr），
         #    需要把它们的输出流也劫持到 PrintCapture，才能转发到 WebSocket。
-        log_handler = logging.StreamHandler(sys.stdout)
-        log_handler.setFormatter(logging.Formatter("%(message)s"))
-        log_handler.setLevel(logging.INFO)
         root_logger = logging.getLogger()
         old_log_level = root_logger.level
         root_logger.setLevel(logging.INFO)
-        root_logger.addHandler(log_handler)
 
-        # 3) 劫持所有已有 StreamHandler 的输出流 → PrintCapture
+        # 确保 root logger 有一个 handler（agent_scraper 的日志靠它向上传播）
+        log_handler: logging.StreamHandler | None = None
+        if not root_logger.handlers:
+            log_handler = logging.StreamHandler(sys.stdout)
+            log_handler.setFormatter(logging.Formatter("%(message)s"))
+            log_handler.setLevel(logging.INFO)
+            root_logger.addHandler(log_handler)
+
+        # 劫持所有已有 StreamHandler 的输出流 → PrintCapture
         saved_streams: list[tuple[logging.StreamHandler, object]] = []
         all_loggers = [logging.getLogger()] + [
             logging.getLogger(name)
@@ -129,9 +133,8 @@ async def create_task(req: CreateTaskRequest):
         for lg in all_loggers:
             for h in lg.handlers:
                 if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
-                    if h is not log_handler:
-                        saved_streams.append((h, h.stream))
-                        h.stream = sys.stdout  # → PrintCapture
+                    saved_streams.append((h, h.stream))
+                    h.stream = sys.stdout  # → PrintCapture
 
         try:
             def on_event(event_type: str, data: dict):
@@ -155,7 +158,8 @@ async def create_task(req: CreateTaskRequest):
             for h, original_stream in saved_streams:
                 h.stream = original_stream
             sys.stdout = old_stdout
-            root_logger.removeHandler(log_handler)
+            if log_handler:
+                root_logger.removeHandler(log_handler)
             root_logger.setLevel(old_log_level)
 
     info._task = asyncio.create_task(run_scraper())
