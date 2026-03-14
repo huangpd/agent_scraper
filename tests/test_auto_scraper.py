@@ -325,12 +325,10 @@ class TestHybridMode:
         """混合字段：文本 + URL"""
         scraper = AutoScraper()
         wanted_dict = {
-            "about": ["CLI-Anything: Making ALL Software Agent-Native"],
-            "star":["7.4k"],
-            "Fork":["660"],
+            "link": ["/David-patrick-chuks","/wael-benslimen"],
         }
 
-        result = scraper.build(url="https://github.com/HKUDS/CLI-Anything", wanted_dict=wanted_dict)
+        result = scraper.build(url="https://github.com/David-patrick-chuks/Riona-AI-Agent", wanted_dict=wanted_dict)
         # 至少应该返回非 None
-        print(scraper.get_result_similar(url="https://github.com/2833844911/cyCronet"))
+        print(scraper.get_result_similar(url="https://github.com/LeoChen-CoreMind/VMPacker",group_by_alias=True))
         assert result is not None or scraper._ml_active

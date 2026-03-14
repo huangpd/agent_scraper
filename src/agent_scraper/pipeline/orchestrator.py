@@ -31,7 +31,7 @@ class AgentScraper:
     async def run(self, instruction: str, images: list[str] | None = None) -> ScrapedResult:
         self._images = images or []
         # 1. 解析自然语言 → 结构化任务
-        logger.info("=" * 60)
+
         logger.info("[AgentScraper] 步骤1: 解析指令...")
         task = await self.task_parser.parse(instruction)
         fields = list(task.extraction_goal.fields.keys())
@@ -63,7 +63,6 @@ class AgentScraper:
 
     async def _run_capture(self, task, source_url: str) -> ScrapedResult:
         """Capture 模式：浏览器导航 + 直接捕获值，跳过 HTML 提取流水线"""
-        logger.info("=" * 60)
         logger.info("[AgentScraper] Capture 模式: Agent 导航并捕获值...")
 
         cap = await self.navigator.navigate_and_capture(
@@ -86,7 +85,6 @@ class AgentScraper:
                 logger.info("  >>> 未捕获到任何值，尝试 extract 模式兜底...")
                 return await self._run_extract(task, source_url)
 
-            logger.info("=" * 60)
             logger.info(f"[AgentScraper] Capture 完成! 捕获 {len(cap.captured)} 个字段")
             self._emit("result", {"data": result.data, "total": result.total_count, "source_url": result.source_url})
             return result
@@ -104,13 +102,11 @@ class AgentScraper:
     async def _run_extract(self, task, source_url: str) -> ScrapedResult:
         """Extract 模式：完整 6 步流水线"""
         # 2. Agent 首次导航 → browser + page + HTML
-        logger.info("=" * 60)
         logger.info("[AgentScraper] 步骤2: Agent 首次导航...")
         nav = await self.navigator.navigate(task.navigation_steps, images=self._images)
 
         try:
             # 3. AI 发现页面遍历规则（仅用户要求遍历时才调用 LLM）
-            logger.info("=" * 60)
             logger.info("[AgentScraper] 步骤3: 分析页面规则...")
             rules = await self.rule_discoverer.discover(
                 nav.html, source_url, task.extraction_goal.traversal_hints
@@ -128,13 +124,11 @@ class AgentScraper:
             logger.info(f"  >>> 规则: {rules_summary}")
 
             # 4. 代码执行规则，遍历所有页面
-            logger.info("=" * 60)
             logger.info("[AgentScraper] 步骤4: 代码执行遍历规则...")
             iterator = PageIterator(nav.browser)
             all_htmls = await iterator.iterate(nav.html, rules, source_url)
 
             # 5. 对每个 HTML 提取数据
-            logger.info("=" * 60)
             logger.info(f"[AgentScraper] 步骤5: 提取数据 ({len(all_htmls)} 个页面)...")
             all_data: dict[str, list] = {}
             for i, html in enumerate(all_htmls):
@@ -148,11 +142,9 @@ class AgentScraper:
             logger.info(f"  >>> 总计: { {k: len(v) for k, v in all_data.items()} }")
 
             # 6. 格式化输出
-            logger.info("=" * 60)
             logger.info("[AgentScraper] 步骤6: 格式化输出...")
             result = await self.formatter.format(all_data, task.extraction_goal, source_url)
 
-            logger.info("=" * 60)
             logger.info(f"[AgentScraper] 完成! 提取 {result.total_count} 条数据")
             self._emit("result", {"data": result.data, "total": result.total_count, "source_url": result.source_url})
             return result

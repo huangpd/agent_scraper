@@ -178,6 +178,8 @@ class PageIterator:
 
         htmls = []
         for i, url in enumerate(urls):
+            if url in visited:
+                continue
             visited.add(url)
             logger.info("进入子页面 [%d/%d]: %s", i + 1, len(urls), url)
             try:
