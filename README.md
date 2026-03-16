@@ -24,9 +24,6 @@ OPENAI_API_KEY=sk-xxx
 OPENAI_BASE_URL=https://api.openai.com/v1
 MODEL_NAME=gpt-4o
 
-# CLI 运行
-python run.py
-
 # Web UI
 python run_server.py
 ```
@@ -41,16 +38,24 @@ python run_server.py
   (LLM 解析)    (Agent 导航)    (LLM 规则)
                                      │
                                      ▼
-                 Extractor  ◀── PageIterator
-                 (CSS+ML+LLM)   (代码遍历)
-                      │
-                      ▼
-                  Formatter
-                  (格式化输出)
-                      │
-                      ▼
-               ScrapedResult (JSON/CSV)
+                              PageIterator
+                              (代码遍历)
+                                     │
+                              yield 每页 HTML
+                                     │
+                                     ▼
+                              Extractor ──▶ 丢弃 HTML
+                              (CSS+ML+LLM)
+                                     │
+                                     ▼
+                               Formatter
+                              (格式化输出)
+                                     │
+                                     ▼
+                          ScrapedResult (JSON/CSV)
 ```
+
+> 流式架构：PageIterator 逐页 yield HTML，Extractor 提取后立即丢弃，内存中始终只保留 1 页 HTML。
 
 ## 项目结构
 
@@ -58,8 +63,8 @@ python run_server.py
 src/
 ├── agent_scraper/              # 核心爬虫引擎（按职责分层）
 │   ├── core/                   # 基础层：数据模型 + LLM 客户端工厂
-│   ├── pipeline/               # 编排层：任务解析 + 流水线调度
-│   ├── browser/                # 浏览器层：导航 + 页面遍历
+│   ├── pipeline/               # 编排层：ReAct 循环 + 工具注册 + 评估重试
+│   ├── browser/                # 浏览器层：导航 + 页面遍历（流式 AsyncGenerator）
 │   └── extraction/             # 提取层：规则发现 + 数据提取 + 格式化
 ├── autoscraper/                # AutoScraper ML 引擎（独立包）
 └── server/                     # Web 服务（FastAPI + WebSocket）
@@ -67,45 +72,6 @@ tests/                          # 单元测试（全 mock，无需真实环境�
 web/                            # 前端（Vite + React + TypeScript）
 ```
 
-## 使用方式
-
-### Python API
-
-```python
-import asyncio
-from dotenv import load_dotenv
-load_dotenv()
-
-from agent_scraper import AgentScraper
-from agent_scraper.extraction.formatter import Formatter
-
-async def main():
-    scraper = AgentScraper(headless=False)
-    result = await scraper.run("""
-        步骤1: 打开网址 https://huggingface.co/meta-llama/Llama-3-8B
-        步骤2: 点击 "Files and versions" 标签页
-        步骤3: 点击"加载更多"直到全部加载
-        步骤4: 提取文件名和下载URL
-
-        样本数据:
-        {"file_name": ".gitattributes", "download_url": "/meta-llama/Llama-3-8B/blob/main/.gitattributes"}
-    """)
-    print(Formatter.to_json(result))
-
-asyncio.run(main())
-```
-
-### REST API
-
-```bash
-# 创建任务
-curl -X POST http://localhost:8000/api/tasks \
-  -H "Content-Type: application/json" \
-  -d '{"instruction": "你的指令...", "headless": true}'
-
-# 查询状态
-curl http://localhost:8000/api/tasks/{task_id}
-```
 
 ### Web UI
 

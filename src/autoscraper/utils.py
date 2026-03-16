@@ -36,7 +36,7 @@ def get_non_rec_text(element):
 def normalize(item):
     if not isinstance(item, str):
         return item
-    return unicodedata.normalize("NFKD", item.strip())
+    return unicodedata.normalize("NFKC", item.strip())
 
 
 def text_match(t1, t2, ratio_limit):

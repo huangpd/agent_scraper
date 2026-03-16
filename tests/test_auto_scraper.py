@@ -324,11 +324,24 @@ class TestHybridMode:
     def test_build_with_mixed_fields(self):
         """混合字段：文本 + URL"""
         scraper = AutoScraper()
+        url = 'https://huggingface.co/datasets/nvidia/Nemotron-ClimbMix/tree/main'
+        # url = 'https://www.ahnews.com.cn/df/hss/pc/lay/node_525.html'
+        # url = 'https://github.com/trending'
         wanted_dict = {
-            "link": ["/David-patrick-chuks","/wael-benslimen"],
+            "file_name": [".gitattributes","README.md"],
+            "download_url": ["/datasets/nvidia/Nemotron-ClimbMix/blob/main/.gitattributes","/datasets/nvidia/Nemotron-ClimbMix/blob/main/README.md"],
         }
+        # wanted_dict = {
+        #     "file_name": ["专人守护、一树一策 黄山多措并举保护古松树","黄山：以营商“软实力”夯实发展“硬支撑”"],
+        #     "download_url": ["http://www.ahnews.com.cn/anhui/pc/con/2026-01/23/562_1662432.html","http://www.ahnews.com.cn/yaowen1/pc/con/2026-01/23/496_1661503.html"],
+        # }
+        # wanted_dict = {
+        #     "file_name": ["Lightpanda: the headless browser designed for AI and automation"],
+        #     "fork": ["660"],
+        # }
 
-        result = scraper.build(url="https://github.com/David-patrick-chuks/Riona-AI-Agent", wanted_dict=wanted_dict)
+        result = scraper.build(url=url, wanted_dict=wanted_dict)
         # 至少应该返回非 None
-        print(scraper.get_result_similar(url="https://github.com/LeoChen-CoreMind/VMPacker",group_by_alias=True))
+        print(scraper.get_result_similar(url=url,group_by_alias=True))
+        print(scraper.get_result_xpath_rule(url=url))
         assert result is not None or scraper._ml_active

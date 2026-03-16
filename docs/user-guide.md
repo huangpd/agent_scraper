@@ -106,55 +106,93 @@ Agent Scraper 的核心是**自然语言指令**。一条好的指令包含三�
 - 帮助 Formatter 自动推断 URL 构造规则（如 `download_url = prefix + file_name`）
 - 明确字段名称，避免 LLM 理解偏差
 
-## 3. 指令示例
+## 3. 测试用例
 
-### 3.1 提取 HuggingFace 模型文件列表
+以下是可直接复制粘贴使用的真实测试指令，覆盖了系统的各类核心能力。
+
+### 3.1 单页提取 — OpenNeuro 数据集文件
+
+> 覆盖能力：导航 → 单页提取（无遍历）
 
 ```
-步骤1: 打开网址 https://huggingface.co/baichuan-inc/Baichuan-M3-235B-FP8
-步骤2: 找到并点击 "Files and versions" 标签页
-步骤3: 下滑页面到最底部，如果页面有 "Load more files" 请点击，直到按钮消失
-步骤4: 遍历所有子文件夹
-步骤5: 提取文件的文件名和下载URL，用json格式
+Step 1: Open the website https://openneuro.org/datasets/ds005511/versions/1.0.1
+Step 2: Extract the file names and format them in JSON format
+
+Sample Data:
+{"file_name": "dataset_description.json"}
+{"file_name": "README.md"}
+```
+
+### 3.2 单页多字段提取 — GitHub Trending
+
+> 覆盖能力：导航 → 单页多字段提取（无遍历、无样本自由模式）
+
+```
+1.打开 https://github.com/trending
+2.获取当前页面的项目URL、start、fork、today_start
+
+提取字段:
+- URL: 项目链接
+- start: start数
+- fork: fork数
+- today_start: today_start数
+```
+
+### 3.3 下一页按钮翻页 — 安徽新闻网
+
+> 覆盖能力：导航 → 下一页按钮遍历 → 多页提取（指定页数上限）
+
+```
+步骤1: 打开 https://www.ahnews.com.cn/df/hss/pc/lay/node_525.html
+步骤2: 获取列表页URL和title，参考【样本数据】
+步骤3: 点击"下一页"链接，获取前15页数据
 
 样本数据:
-{"file_name": ".gitattributes", "download_url": "/baichuan-inc/Baichuan-M3-235B-FP8/blob/main/.gitattributes"}
+{"title":"专人守护、一树一策 黄山多措并举保护古松树","URL":"http://www.ahnews.com.cn/anhui/pc/con/2026-01/23/562_1662432.html"}
+{"title":"黄山：以营商"软实力"夯实发展"硬支撑"","URL":"http://www.ahnews.com.cn/yaowen1/pc/con/2026-01/23/496_1661503.html"}
 ```
 
-**触发的能力**：导航 → 点击标签 → 加载更多 + 子页面遍历 → JSON 提取
+### 3.4 加载更多 + 子页面遍历 — HuggingFace 数据集
 
-### 3.2 提取商品列表（带翻页）
-
-```
-步骤1: 打开网址 https://example-shop.com/products
-步骤2: 提取每一页的商品名称、价格和链接
-
-样本数据:
-{"name": "无线鼠标", "price": "¥89.00", "link": "/products/wireless-mouse"}
-```
-
-**触发的能力**：导航 → 自动检测翻页 → 多页提取
-
-### 3.3 单页简单提取
+> 覆盖能力：导航 → 点击标签 → 加载更多 + 子页面遍历 → JSON 提取
 
 ```
-步骤1: 打开网址 https://github.com/trending
-步骤2: 提取仓库名称、描述和星标数
+Step 1: Open the website https://huggingface.co/datasets/nvidia/Nemotron-ClimbMix
+Step 2: Locate and click on the "Files and versions" tab
+Step 3: Scroll down the page to the bottom. If there is a "Load more files" button, click it until the button disappears
+Step 4: Traverse all subfolders
+Step 5: Extract the file names and download URLs of the pages in JSON format
+
+Sample data:
+{"file_name":".gitattributes","download_url":"/datasets/nvidia/Nemotron-ClimbMix/blob/main/.gitattributes"}
+{"file_name":"README.md","download_url":"/datasets/nvidia/Nemotron-ClimbMix/blob/main/README.md"}
 ```
 
-**触发的能力**：导航 → 单页提取（无遍历）
+### 3.5 加载更多 + 子页面遍历 — HuggingFace 模型
 
-### 3.4 论坛帖子列表（下一页按钮）
+> 覆盖能力：导航 → 点击标签 → 加载更多 + 子页面遍历 → JSON 提取（大量文件）
 
 ```
-步骤1: 打开网址 https://forum.example.com/latest
-步骤2: 提取所有页的帖子标题、作者和发布时间，点击下一页直到没有更多
+Step 1: Open the website https://huggingface.co/baichuan-inc/Baichuan-M3-235B-FP8
+Step 2: Locate and click on the "Files and versions" tab
+Step 3: Scroll down the page to the bottom. If there is a "Load more files" button, click it until the button disappears
+Step 4: Traverse all subfolders
+Step 5: Extract the file names and download URLs of the pages in JSON format
 
-样本数据:
-{"title": "如何学习Python", "author": "张三", "date": "2024-01-15"}
+Sample data:
+{"file_name":".gitattributes","download_url":"/baichuan-inc/Baichuan-M3-235B-FP8/blob/main/.gitattributes"}
+{"file_name":"README.md","download_url":"/baichuan-inc/Baichuan-M3-235B-FP8/blob/main/README.md"}
 ```
 
-**触发的能力**：导航 → 下一页按钮遍历 → 多页提取
+### 3.6 能力覆盖总结
+
+| 测试用例 | 遍历模式 | 样本 | 页面数量 | 核心验证点 |
+|---------|---------|------|---------|-----------|
+| 3.1 OpenNeuro | 无 | 有 | 单页 | 基础单页提取 |
+| 3.2 GitHub Trending | 无 | 无 | 单页 | 自由模式（无样本）多字段提取 |
+| 3.3 安徽新闻 | 下一页按钮 | 有 | 15 页 | 翻页遍历 + 页数限制 |
+| 3.4 HF 数据集 | 加载更多 + 子页面 | 有 | 多页 | Load more + 递归子文件夹 |
+| 3.5 HF 模型 | 加载更多 + 子页面 | 有 | 大量页面 | 大规模文件列表 + 流式内存优化 |
 
 ## 4. 使用方式
 
@@ -306,4 +344,5 @@ curl $OPENAI_BASE_URL/models -H "Authorization: Bearer $OPENAI_API_KEY"
 
 - LLM 只在第一页调用（解析指令 + 发现规则 + 首次提取）
 - 第 2+ 页使用缓存的 CSS 选择器，零 LLM 调用
+- 流式逐页提取架构，HTML 提取后即丢弃，即使 1000+ 页也不会内存溢出
 - 如需进一步降低消耗，可将 `MODEL_NAME` 换成更便宜的模型（如 `gpt-4o-mini`）

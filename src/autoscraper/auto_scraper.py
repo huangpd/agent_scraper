@@ -1,8 +1,12 @@
 """
-AutoScraper - ML Enhanced Drop-in Replacement
-原版 API 完全兼容，新增两项能力：
-  1. _get_valid_attrs 自动过滤哈希 class（如 prc-Counter-Badge-wQ2rT）
-  2. build() 失败时自动 fallback 到随机森林分类器
+AutoScraper - 基于样本数据自动推导 XPath 规则的网页抓取器
+
+流程：
+  1. build()  — 在训练页面上根据样本数据学习 DOM 路径（stack）
+     · 规则模式：精确文本/属性匹配
+     · ML 模式（fallback）：文本匹配失败时，用随机森林定位目标节点
+  2. _stack_to_xpath()  — 将学到的 stack 反推为精准 XPath 表达式
+  3. get_result_similar() — 在任意页面上应用 XPath 规则提取数据
 """
 
 import hashlib
@@ -10,14 +14,19 @@ import json
 import logging
 import re
 from collections import defaultdict
-
-logger = logging.getLogger(__name__)
 from difflib import SequenceMatcher
 from html import unescape
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    import numpy as np
+    from sklearn.ensemble import RandomForestClassifier
+    _ML_AVAILABLE = True
+except ImportError:
+    _ML_AVAILABLE = False
 
 from autoscraper.utils import (
     FuzzyText,
@@ -29,25 +38,16 @@ from autoscraper.utils import (
     unique_stack_list,
 )
 
-# ─────────────────────────────────────────────────────────
-# ML 依赖（软依赖，未安装时自动降级为纯规则模式）
-# ─────────────────────────────────────────────────────────
-try:
-    import numpy as np
-    from sklearn.ensemble import RandomForestClassifier
-    _ML_AVAILABLE = True
-except ImportError:
-    _ML_AVAILABLE = False
-
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────
 # 哈希 class 检测
 # ─────────────────────────────────────────────────────────
 _HASHED_PATTERNS = [
-    re.compile(r'-[A-Za-z0-9]{4,8}$'),             # 末尾 -xXxX，如 Badge-wQ2rT
-    re.compile(r'__[A-Za-z0-9]{4,}$'),              # CSS Modules，如 content__IwGAp
-    re.compile(r'^[a-z]-[a-f0-9]{6,}'),             # 单字母前缀 + hex
-    re.compile(r'[A-Z]{2,}[0-9][A-Za-z0-9]{2,}'),  # 混合大写+数字，如 PageLayout3Xk
+    re.compile(r'-[A-Za-z0-9]{4,8}$'),
+    re.compile(r'__[A-Za-z0-9]{4,}$'),
+    re.compile(r'^[a-z]-[a-f0-9]{6,}'),
+    re.compile(r'[A-Z]{2,}[0-9][A-Za-z0-9]{2,}'),
 ]
 
 def _is_hashed_class(cls: str) -> bool:
@@ -59,447 +59,277 @@ def _is_hashed_class(cls: str) -> bool:
     return False
 
 def _stable_classes(classes) -> list:
-    if not classes:
-        return []
-    if isinstance(classes, str):
-        classes = classes.split()
+    if not classes: return []
+    if isinstance(classes, str): classes = classes.split()
     return [c for c in classes if not _is_hashed_class(c)]
 
+# ─────────────────────────────────────────────────────────
+# Variant class 检测（位置/状态类，不应出现在 XPath 谓词中）
+# ─────────────────────────────────────────────────────────
+_VARIANT_EXACT = frozenset({
+    "first", "last", "odd", "even",
+    "active", "current", "selected",
+    "open", "closed", "disabled", "hidden", "visible",
+})
+_VARIANT_PATTERNS = [
+    re.compile(r'-(first|last|odd|even|active|current|selected)$', re.I),
+    re.compile(r'^(first|last|odd|even|active)-', re.I),
+    re.compile(r'^is-'),   # is-active, is-open, etc.
+]
+
+def _is_variant_class(cls: str) -> bool:
+    if cls.lower() in _VARIANT_EXACT:
+        return True
+    return any(p.search(cls) for p in _VARIANT_PATTERNS)
 
 # ─────────────────────────────────────────────────────────
-# ML 特征提取（仅在 sklearn 可用时使用）
+# 动态 ID 检测
 # ─────────────────────────────────────────────────────────
-_SEMANTIC_TAGS = {
-    'h1','h2','h3','h4','h5','h6','p','a','span','strong',
-    'em','li','td','th','code','pre','blockquote','button','label',
-}
-_SEMANTIC_CLASSES = [
-    'f4','f3','f1','btn','link','title','readme','description',
-    'counter','label','text','name','number','badge','header',
+_DYNAMIC_ID_PATTERNS = [
+    re.compile(r'\d{5,}'),                 # 长数字序列: id="el12345"
+    re.compile(r'^[a-z]-[a-f0-9]{6,}'),    # CSS-module 风格: id="a-3f2b1c"
+    re.compile(r'^[a-f0-9]{8,}$'),          # 纯十六进制哈希
+    re.compile(r'[-_][a-f0-9]{6,}$'),       # 尾部哈希: id="item-a3b2c1"
+    re.compile(r'^:'),                       # React/框架生成: id=":r1:"
+    re.compile(r'^(ember|react|vue|ng)-'),   # 框架前缀
 ]
-_NUMERIC_KEYS = [
-    'depth','sibling_count','sibling_index','sibling_ratio',
-    'stable_class_count','has_href','has_id','has_title_attr',
-    'text_len','text_len_bucket','has_digits','is_short_number',
-    'child_count','is_semantic_tag',
-] + [f'has_cls_{c}' for c in _SEMANTIC_CLASSES]
-_CAT_KEYS = ['tag', 'stable_classes', 'id_value', 'id_prefix',
-             'ancestor_0_tag', 'ancestor_1_tag', 'ancestor_2_tag']
+
+def _is_stable_id(id_str: str) -> bool:
+    """判断 HTML id 属性是否稳定（非动态生成）。"""
+    if not id_str:
+        return False
+    for pattern in _DYNAMIC_ID_PATTERNS:
+        if pattern.search(id_str):
+            return False
+    return True
+
+# ─────────────────────────────────────────────────────────
+# ML 特征提取
+# ─────────────────────────────────────────────────────────
+_SEMANTIC_TAGS = {'h1','h2','h3','h4','h5','h6','p','a','span','li','td','button'}
+_SEMANTIC_CLASSES = ['title','description','name','price','date','link','item']
+_NUMERIC_KEYS = ['depth','sibling_count','sibling_index','child_count']
+_CAT_KEYS = ['tag', 'id_prefix', 'ancestor_0_tag']
 
 def _extract_node_features(node, soup) -> dict:
-    f = {}
-    f['tag'] = node.name or ''
-    f['is_semantic_tag'] = int(node.name in _SEMANTIC_TAGS)
-
-    ancestors = list(node.parents)
-    f['depth'] = len(ancestors)
-
+    f = {'tag': node.name or '', 'depth': len(list(node.parents))}
     parent = node.parent
     if parent:
         siblings = [s for s in parent.children if hasattr(s, 'name') and s.name == node.name]
         f['sibling_count'] = len(siblings)
         f['sibling_index'] = siblings.index(node) if node in siblings else 0
-        f['sibling_ratio'] = f['sibling_index'] / max(f['sibling_count'] - 1, 1)
     else:
         f['sibling_count'] = f['sibling_index'] = 0
-        f['sibling_ratio'] = 0.0
-
-    classes = _stable_classes(node.attrs.get('class', []))
-    f['stable_class_count'] = len(classes)
-    f['stable_classes'] = ' '.join(sorted(classes))
-    for c in _SEMANTIC_CLASSES:
-        f[f'has_cls_{c}'] = int(c in classes)
-
-    f['has_href'] = int('href' in node.attrs)
-    f['has_id'] = int('id' in node.attrs)
-    f['has_title_attr'] = int('title' in node.attrs)
-    f['id_value'] = node.attrs.get('id', '')
-    # id 前缀作为稳定特征（如 repo-stars vs repo-forks，去掉纯数字后缀）
-    raw_id = node.attrs.get('id', '')
-    f['id_prefix'] = re.sub(r'-?\d+$', '', raw_id)  # repo-stars-counter-star → repo-stars-counter-star
-
-    text = node.get_text(strip=True)
-    f['text_len'] = len(text)
-    f['text_len_bucket'] = min(len(text) // 20, 10)
-    f['has_digits'] = int(any(c.isdigit() for c in text))
-    f['is_short_number'] = int(bool(re.match(r'^\d+\.?\d*[kKmMbB]?$', text)))
+    f['id_prefix'] = re.sub(r'-?\d+$', '', node.attrs.get('id', ''))
     f['child_count'] = len(list(node.children))
-
-    for i, anc in enumerate(ancestors[:3]):
-        f[f'ancestor_{i}_tag'] = anc.name or ''
-
+    ancestors = list(node.parents)
+    f['ancestor_0_tag'] = ancestors[0].name if ancestors else ''
     return f
 
 def _features_to_vector(features: dict, vocab: dict = None):
     numeric_vec = [float(features.get(k, 0)) for k in _NUMERIC_KEYS]
-
     building = vocab is None
-    if building:
-        vocab = {k: {} for k in _CAT_KEYS}
-
+    if building: vocab = {k: {} for k in _CAT_KEYS}
     cat_vec = []
     for k in _CAT_KEYS:
         val = str(features.get(k, ''))
-        if building and val not in vocab[k]:
-            vocab[k][val] = len(vocab[k])
+        if building and val not in vocab[k]: vocab[k][val] = len(vocab[k])
         cat_vec.append(float(vocab[k].get(val, len(vocab[k]))))
-
     return np.array(numeric_vec + cat_vec, dtype=np.float32), vocab
 
-
 # ─────────────────────────────────────────────────────────
-# 主类：AutoScraper（兼容原版，自动 ML 增强）
+# AutoScraper 类
 # ─────────────────────────────────────────────────────────
 
 class AutoScraper(object):
-    """
-    AutoScraper : A Smart, Automatic, Fast and Lightweight Web Scraper for Python.
-    ML Enhanced: 自动过滤哈希 class，并在规则失效时 fallback 到随机森林分类器。
-
-    新增参数：
-      build(..., use_ml=True)            - 是否启用 ML fallback（默认开启）
-      get_result_similar(..., ml_threshold=0.5) - ML 模式下的概率阈值
-
-    原版所有 API 完全不变。
-    """
-
     request_headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/84.0.4147.135 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     def __init__(self, stack_list=None):
         self.stack_list = stack_list or []
-        # ML 状态（规则模式失败时启用）
-        self._ml_classifiers = {}
-        self._ml_vocabs = {}
-        self._ml_n_positives = {}
-        self._ml_active = False
 
     # ── 持久化 ──────────────────────────────────────────
 
     def save(self, file_path):
-        data = dict(stack_list=self.stack_list)
-        with open(file_path, "w") as f:
-            json.dump(data, f)
+        """保存学习结果到 JSON 文件（stacks + XPath 规则）。"""
+        data = {
+            "stack_list": self.stack_list,
+            "xpath_rules": self.get_result_xpath_rule(),
+        }
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
     def load(self, file_path):
-        with open(file_path, "r") as f:
+        """从 JSON 文件加载学习结果。"""
+        with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
             self.stack_list = data
-            return
-        self.stack_list = data["stack_list"]
-
-    # ── 网络 / 解析 ──────────────────────────────────────
+        else:
+            self.stack_list = data.get("stack_list", [])
 
     @classmethod
     def _fetch_html(cls, url, request_args=None):
-        request_args = request_args or {}
-        headers = dict(cls.request_headers)
-        if url:
-            headers["Host"] = urlparse(url).netloc
-        user_headers = request_args.pop("headers", {})
-        headers.update(user_headers)
-        res = requests.get(url, headers=headers, **request_args)
-        if res.encoding == "ISO-8859-1" and "ISO-8859-1" not in res.headers.get("Content-Type", ""):
-            res.encoding = res.apparent_encoding
+        res = requests.get(url, headers=cls.request_headers, **(request_args or {}))
+        res.encoding = res.apparent_encoding
         return res.text
 
     @classmethod
     def _get_soup(cls, url=None, html=None, request_args=None):
-        if html:
-            return BeautifulSoup(normalize(unescape(html)), "lxml")
-        html = cls._fetch_html(url, request_args)
-        return BeautifulSoup(normalize(unescape(html)), "lxml")
-
-    # ── 核心改动①：_get_valid_attrs 过滤哈希 class ──────
+        content = html if html else cls._fetch_html(url, request_args)
+        return BeautifulSoup(normalize(unescape(content)), "lxml")
 
     @staticmethod
     def _get_valid_attrs(item):
-        key_attrs = {"class", "style"}
-        attrs = {
-            k: v if v != [] else "" for k, v in item.attrs.items() if k in key_attrs
-        }
-        for attr in key_attrs:
-            if attr not in attrs:
-                attrs[attr] = ""
-
-        # ★ 过滤哈希 class，只保留语义化稳定的 class
-        if isinstance(attrs.get("class"), list):
+        key_attrs = {"class", "id"}
+        attrs = {k: v for k, v in item.attrs.items() if k in key_attrs}
+        if "class" in attrs and isinstance(attrs["class"], list):
             attrs["class"] = _stable_classes(attrs["class"])
-
         return attrs
 
-    # ── 原版逻辑（基本不变）──────────────────────────────
+    def build(self, url=None, wanted_list=None, wanted_dict=None, html=None,
+              request_args=None, update=False, text_fuzz_ratio=1.0, use_ml=True):
+        """在训练页面上根据样本数据学习 DOM 路径，反推 XPath 规则。
 
-    @staticmethod
-    def _child_has_text(child, text, url, text_fuzz_ratio):
-        child_text = child.getText().strip()
-        if text_match(text, child_text, text_fuzz_ratio):
-            parent_text = child.parent.getText().strip()
-            if child_text == parent_text and child.parent.parent:
+        流程：
+        1. 规则模式：精确文本/属性匹配 → 构建 stack
+        2. ML fallback（use_ml=True 且 sklearn 可用）：规则模式为空时，
+           用随机森林分类器定位目标节点 → 构建 stack
+        3. 所有 stack 统一经 _stack_to_xpath 转为 XPath 规则
+
+        Returns:
+            dict | None: {alias: xpath_string} 或 None（无匹配）
+        """
+        soup = self._get_soup(url=url, html=html, request_args=request_args)
+        if not update:
+            self.stack_list = []
+
+        _wdict = wanted_dict or {"default": wanted_list or []}
+
+        # Step 1: 规则模式 — 精确文本/属性匹配
+        for alias, targets in _wdict.items():
+            for target in targets:
+                target = normalize(target)
+                for child in reversed(soup.find_all(True)):
+                    if self._child_matches(child, target, url, text_fuzz_ratio):
+                        stack = self._build_stack(child, url)
+                        stack["alias"] = alias
+                        self.stack_list.append(stack)
+
+        self.stack_list = unique_stack_list(self.stack_list)
+
+        # Step 2: ML fallback — 规则模式未找到结果时启用
+        if not self.stack_list and use_ml and _ML_AVAILABLE:
+            logger.info("规则模式未找到结果，切换到 ML 模式...")
+            self._ml_build_stacks(soup, url, _wdict, text_fuzz_ratio)
+            self.stack_list = unique_stack_list(self.stack_list)
+
+        # 统一返回 XPath 规则
+        rules = self.get_result_xpath_rule()
+        if rules:
+            for alias, xpath in rules.items():
+                logger.debug("最终 XPath  alias='%s': %s", alias, xpath)
+        return rules
+
+    def _child_matches(self, child, text, url, fuzz):
+        """检查 child 是否匹配目标文本。
+
+        匹配顺序：
+        1. 完整文本（getText）
+        2. 直接文本（不含子节点递归文本）
+        3. 属性值精确匹配
+        4. href/src 属性的完整 URL 匹配（urljoin 拼接后比对）
+        """
+        # 1) 完整文本
+        child_text = normalize(child.get_text(strip=True))
+        if text_match(text, child_text, fuzz):
+            # 去重：如果父节点文本完全相同，跳过（保留最内层）
+            parent_text = normalize(child.parent.get_text(strip=True)) if child.parent else ""
+            if child_text == parent_text and child.parent and child.parent.parent:
                 return False
             child.wanted_attr = None
             return True
 
-        if text_match(text, get_non_rec_text(child), text_fuzz_ratio):
-            child.is_non_rec_text = True
+        # 2) 直接文本（不含子节点）
+        non_rec = normalize(get_non_rec_text(child))
+        if non_rec and text_match(text, non_rec, fuzz):
             child.wanted_attr = None
+            child.is_non_rec_text = True
             return True
 
-        for key, value in child.attrs.items():
-            if not isinstance(value, str):
+        # 3) 属性值匹配 + URL 匹配
+        for k, v in child.attrs.items():
+            if not isinstance(v, str):
                 continue
-            value = value.strip()
-            if text_match(text, value, text_fuzz_ratio):
-                child.wanted_attr = key
+            v = normalize(v.strip())
+            if text_match(text, v, fuzz):
+                child.wanted_attr = k
                 return True
-            if key in {"href", "src"}:
-                full_url = urljoin(url, value)
-                if text_match(text, full_url, text_fuzz_ratio):
-                    child.wanted_attr = key
-                    child.is_full_url = True
+            # URL 宽松匹配：完整 URL 样本 vs 相对路径属性值
+            if k in ("href", "src") and url:
+                full_url = urljoin(url, v)
+                if text_match(text, full_url, fuzz):
+                    child.wanted_attr = k
                     return True
         return False
-
-    def _get_children(self, soup, text, url, text_fuzz_ratio):
-        children = reversed(soup.findChildren())
-        return [x for x in children if self._child_has_text(x, text, url, text_fuzz_ratio)]
 
     @classmethod
     def _build_stack(cls, child, url):
         content = [(child.name, cls._get_valid_attrs(child))]
         parent = child
         while True:
-            grand_parent = parent.findParent()
-            if not grand_parent:
-                break
-            children = grand_parent.findAll(parent.name, cls._get_valid_attrs(parent), recursive=False)
-            for i, c in enumerate(children):
+            gp = parent.find_parent()
+            if not gp or gp.name == "[document]": break
+            # 构造搜索属性，移除空 class 避免 BeautifulSoup 匹配异常
+            # （空列表会匹配"没有 class 的元素"而非"所有同 tag 元素"）
+            search_attrs = cls._get_valid_attrs(parent)
+            if "class" in search_attrs and not search_attrs["class"]:
+                search_attrs.pop("class")
+            siblings = gp.find_all(parent.name, search_attrs, recursive=False)
+            # tag-only 兄弟计数（更宽松，反映真实重复度）
+            tag_only_siblings = gp.find_all(parent.name, recursive=False)
+            tag_only_count = len(tag_only_siblings)
+            for i, c in enumerate(siblings):
                 if c == parent:
-                    content.insert(0, (grand_parent.name, cls._get_valid_attrs(grand_parent), i))
+                    # 5-tuple: (tag, attrs, child_index, child_sibling_count, tag_only_count)
+                    # child_index: content[k+1] 在同类兄弟中的位置
+                    # child_sibling_count: class-filtered 同类兄弟总数
+                    # tag_only_count: 仅按 tag 搜索的兄弟总数（用于判断是否为重复元素）
+                    content.insert(0, (gp.name, cls._get_valid_attrs(gp), i, len(siblings), tag_only_count))
                     break
-            if not grand_parent.parent:
-                break
-            parent = grand_parent
-
+            else:
+                # 未在过滤后的兄弟中找到自身，记录为无索引层级（避免丢层）
+                content.insert(0, (gp.name, cls._get_valid_attrs(gp)))
+            parent = gp
+        
         wanted_attr = getattr(child, "wanted_attr", None)
-        is_full_url = getattr(child, "is_full_url", False)
-        is_non_rec_text = getattr(child, "is_non_rec_text", False)
-        stack = dict(
-            content=content,
-            wanted_attr=wanted_attr,
-            is_full_url=is_full_url,
-            is_non_rec_text=is_non_rec_text,
-        )
-        stack["url"] = url if is_full_url else ""
-        stack["hash"] = hashlib.sha256(str(stack).encode("utf-8")).hexdigest()
-        stack["stack_id"] = "rule_" + stack["hash"][:8]
+        # hash 必须包含 wanted_attr，否则同路径不同提取目标的 stack 会被去重
+        hash_input = str((content, wanted_attr)).encode()
+        stack = {
+            "content": content,
+            "wanted_attr": wanted_attr,
+            "hash": hashlib.sha256(hash_input).hexdigest(),
+            "stack_id": hashlib.sha256(hash_input).hexdigest()[:8],
+        }
         return stack
 
-    def _get_result_for_child(self, child, soup, url):
-        stack = self._build_stack(child, url)
-        result = self._get_result_with_stack(stack, soup, url, 1.0)
-        return result, stack
-
-    @staticmethod
-    def _fetch_result_from_child(child, wanted_attr, is_full_url, url, is_non_rec_text):
-        if wanted_attr is None:
-            if is_non_rec_text:
-                return get_non_rec_text(child)
-            return child.getText().strip()
-        if wanted_attr not in child.attrs:
-            return None
-        if is_full_url:
-            return urljoin(url, child.attrs[wanted_attr])
-        return child.attrs[wanted_attr]
-
-    @staticmethod
-    def _get_fuzzy_attrs(attrs, attr_fuzz_ratio):
-        attrs = dict(attrs)
-        for key, val in attrs.items():
-            if isinstance(val, str) and val:
-                val = FuzzyText(val, attr_fuzz_ratio)
-            elif isinstance(val, (list, tuple)):
-                val = [FuzzyText(x, attr_fuzz_ratio) if x else x for x in val]
-            attrs[key] = val
-        return attrs
-
-    def _get_result_with_stack(self, stack, soup, url, attr_fuzz_ratio, **kwargs):
-        parents = [soup]
-        stack_content = stack["content"]
-        contain_sibling_leaves = kwargs.get("contain_sibling_leaves", False)
-
-        for index, item in enumerate(stack_content):
-            children = []
-            if item[0] == "[document]":
-                continue
-            for parent in parents:
-                attrs = item[1]
-                if attr_fuzz_ratio < 1.0:
-                    attrs = self._get_fuzzy_attrs(attrs, attr_fuzz_ratio)
-                found = parent.findAll(item[0], attrs, recursive=False)
-                if not found:
-                    continue
-                if not contain_sibling_leaves and index == len(stack_content) - 1:
-                    idx = min(len(found) - 1, stack_content[index - 1][2])
-                    found = [found[idx]]
-                children += found
-            parents = children
-
-        wanted_attr = stack["wanted_attr"]
-        is_full_url = stack["is_full_url"]
-        is_non_rec_text = stack.get("is_non_rec_text", False)
-        result = [
-            ResultItem(
-                self._fetch_result_from_child(i, wanted_attr, is_full_url, url, is_non_rec_text),
-                getattr(i, "child_index", 0),
-            )
-            for i in parents
-        ]
-        if not kwargs.get("keep_blank", False):
-            result = [x for x in result if x.text]
-        return result
-
-    def _get_result_with_stack_index_based(self, stack, soup, url, attr_fuzz_ratio, **kwargs):
-        p = soup.findChildren(recursive=False)[0]
-        stack_content = stack["content"]
-        for index, item in enumerate(stack_content[:-1]):
-            if item[0] == "[document]":
-                continue
-            content = stack_content[index + 1]
-            attrs = content[1]
-            if attr_fuzz_ratio < 1.0:
-                attrs = self._get_fuzzy_attrs(attrs, attr_fuzz_ratio)
-            p = p.findAll(content[0], attrs, recursive=False)
-            if not p:
-                return []
-            idx = min(len(p) - 1, item[2])
-            p = p[idx]
-
-        result = [
-            ResultItem(
-                self._fetch_result_from_child(
-                    p, stack["wanted_attr"], stack["is_full_url"], url, stack["is_non_rec_text"]
-                ),
-                getattr(p, "child_index", 0),
-            )
-        ]
-        if not kwargs.get("keep_blank", False):
-            result = [x for x in result if x.text]
-        return result
-
-    def _get_result_by_func(self, func, url, html, soup, request_args,
-                            grouped, group_by_alias, unique, attr_fuzz_ratio, **kwargs):
-        if not soup:
-            soup = self._get_soup(url=url, html=html, request_args=request_args)
-
-        keep_order = kwargs.get("keep_order", False)
-        if group_by_alias or (keep_order and not grouped):
-            for index, child in enumerate(soup.findChildren()):
-                setattr(child, "child_index", index)
-
-        result_list = []
-        grouped_result = defaultdict(list)
-        for stack in self.stack_list:
-            if not url:
-                url = stack.get("url", "")
-            result = func(stack, soup, url, attr_fuzz_ratio, **kwargs)
-            if not grouped and not group_by_alias:
-                result_list += result
-                continue
-            group_id = stack.get("alias", "") if group_by_alias else stack["stack_id"]
-            grouped_result[group_id] += result
-
-        return self._clean_result(result_list, grouped_result, grouped, group_by_alias, unique, keep_order)
-
-    @staticmethod
-    def _clean_result(result_list, grouped_result, grouped, grouped_by_alias, unique, keep_order):
-        if not grouped and not grouped_by_alias:
-            if unique is None:
-                unique = True
-            if keep_order:
-                result_list = sorted(result_list, key=lambda x: x.index)
-            result = [x.text for x in result_list]
-            if unique:
-                result = unique_hashable(result)
-            return result
-
-        for k, val in grouped_result.items():
-            if grouped_by_alias:
-                val = sorted(val, key=lambda x: x.index)
-            val = [x.text for x in val]
-            if unique:
-                val = unique_hashable(val)
-            grouped_result[k] = val
-        return dict(grouped_result)
-
-    # ── 核心改动②：build() 失败时自动 fallback 到 ML ────
-
-    def build(self, url=None, wanted_list=None, wanted_dict=None, html=None,
-              request_args=None, update=False, text_fuzz_ratio=1.0, use_ml=True):
-        """
-        原版参数完全兼容。新增：
-          use_ml: bool = True  - 规则模式返回空时自动 fallback 到随机森林
-        """
-        if not wanted_list and not (wanted_dict and any(wanted_dict.values())):
-            raise ValueError("No targets were supplied")
-
-        soup = self._get_soup(url=url, html=html, request_args=request_args)
-
-        if update is False:
-            self.stack_list = []
-
-        result_list = []
-        _wanted_dict = wanted_dict or {}
-        if wanted_list:
-            _wanted_dict = {"": wanted_list}
-
-        _flat_wanted = []
-        for alias, items in _wanted_dict.items():
-            items = [normalize(w) for w in items]
-            _flat_wanted += items
-            for wanted in items:
-                children = self._get_children(soup, wanted, url, text_fuzz_ratio)
-                for child in children:
-                    result, stack = self._get_result_for_child(child, soup, url)
-                    stack["alias"] = alias
-                    result_list += result
-                    self.stack_list.append(stack)
-
-        result_list = unique_hashable([item.text for item in result_list])
-        self.stack_list = unique_stack_list(self.stack_list)
-
-        # ★ 核心改动②：规则结果为空且 sklearn 可用时，启动 ML 训练
-        if not result_list and use_ml and _ML_AVAILABLE:
-            logger.info("规则模式未找到结果，切换到 ML 模式...")
-            self._ml_active = True
-            self._ml_build(soup, url, _wanted_dict, text_fuzz_ratio)
-            # 返回 ML 在训练页的回放结果
-            return self._ml_get_result(soup, url, threshold=0.3)
-
-        self._ml_active = False
-        return result_list
-
-    # ── ML 内部方法 ──────────────────────────────────────
+    # ── ML 辅助：节点签名 + 兄弟扩展 + ML → stack 桥接 ──
 
     @staticmethod
     def _node_signature(node) -> str:
-        """节点结构签名：tag + 稳定class + 父tag，用于判断是否同类兄弟"""
+        """节点结构签名：tag + 稳定 class + 父 tag，用于判断同类兄弟。"""
         stable = tuple(sorted(_stable_classes(node.attrs.get('class', []))))
         parent_tag = node.parent.name if node.parent else ''
         return f"{node.name}|{stable}|{parent_tag}"
 
-    def _expand_to_siblings(self, seed_nodes: list, all_nodes: list) -> set:
-        """
-        列表页核心：找出页面上所有结构相同的节点作为正样本。
+    def _expand_to_siblings(self, seed_nodes, all_nodes) -> set:
+        """从种子节点出发，找出所有结构相同的兄弟节点索引。
 
-        两层匹配策略：
-        1. 严格模式：同一父节点下 tag+稳定class 相同（普通兄弟）
-        2. 宽松模式：全页面 tag+稳定class+父tag 相同（列表项，如每个<li>里的<a>）
-           额外要求：祖父节点的结构签名也相同，防止误匹配导航栏等无关节点
+        两层策略：
+        1. 严格模式：同一父节点下 tag+稳定class 相同（直接兄弟）
+        2. 宽松模式：全页面 tag+稳定class+父tag 相同（列表项重复模式）
+           额外要求：祖父节点签名也相同，防止误匹配导航栏等无关区域
         """
         expanded = set()
         for seed in seed_nodes:
@@ -509,17 +339,15 @@ class AutoScraper(object):
                 continue
 
             # 策略1：同一父节点下的直接兄弟
-            same_parent_hits = set()
-            for i, node in enumerate(all_nodes):
-                if node.parent == parent and self._node_signature(node) == sig:
-                    same_parent_hits.add(i)
+            same_parent = {
+                i for i, node in enumerate(all_nodes)
+                if node.parent is parent and self._node_signature(node) == sig
+            }
 
-            if len(same_parent_hits) > 1:
-                # 有真实兄弟，直接用
-                expanded |= same_parent_hits
+            if len(same_parent) > 1:
+                expanded |= same_parent
             else:
-                # 策略2：列表模式，父节点本身是可重复的（如<li>）
-                # 要求父节点的结构签名也相同
+                # 策略2：列表模式——父节点本身可重复（如 <li>）
                 parent_sig = self._node_signature(parent)
                 for i, node in enumerate(all_nodes):
                     if (self._node_signature(node) == sig
@@ -529,74 +357,66 @@ class AutoScraper(object):
 
         return expanded
 
-    def _ml_build(self, soup, url, wanted_dict, fuzz_ratio=1.0):
-        """训练随机森林分类器（支持列表页自动扩充同类兄弟节点）"""
-        self._ml_classifiers = {}
-        self._ml_vocabs = {}
-        self._ml_n_positives = {}  # 记录每个 alias 的正样本数，用于单样本特殊处理
-        self._ml_wanted_dict = wanted_dict  # 保存原始样本，用于推断字段类型
+    def _ml_build_stacks(self, soup, url, wanted_dict, fuzz_ratio):
+        """ML 模式：用随机森林定位目标节点，然后构建 stack 反推 XPath。
 
+        流程：
+        1. 文本/属性匹配找到种子节点
+        2. _expand_to_siblings 扩展到全部同结构节点
+        3. 随机森林训练，找出概率最高的代表节点
+        4. 从代表节点构建 stack（后续由 _stack_to_xpath 转为 XPath）
+        """
         all_nodes = [n for n in soup.find_all(True) if n.name]
         all_features = [_extract_node_features(n, soup) for n in all_nodes]
 
         for alias, targets in wanted_dict.items():
             targets = [normalize(t) for t in targets]
-            seed_nodes = []  # 直接命中的种子节点
 
-            # 预处理：对 URL 类 target，提取 path 用于宽松匹配
-            target_paths = {}
-            for t in targets:
-                if t.startswith("http"):
-                    target_paths[t] = urlparse(t).path
-                elif t.startswith("/"):
-                    target_paths[t] = t
-
+            # ── 找种子节点 ──
+            seed_nodes = []
             for target in targets:
-                target_path = target_paths.get(target)
-                for i, node in enumerate(all_nodes):
-                    text = node.get_text(strip=True)
-                    hit = (SequenceMatcher(None, target, text).ratio() >= fuzz_ratio
-                           if fuzz_ratio < 1.0 else text == target)
+                target_path = urlparse(target).path if target.startswith("http") else (
+                    target if target.startswith("/") else None
+                )
+                for node in all_nodes:
+                    hit = False
+                    # 文本匹配（复用 text_match，与 _child_matches 一致）
+                    text = normalize(node.get_text(strip=True))
+                    hit = text_match(target, text, fuzz_ratio)
+                    # 属性匹配
                     if not hit:
                         for val in node.attrs.values():
-                            if isinstance(val, str):
-                                val_s = val.strip()
-                                # 精确匹配
-                                if val_s == target:
-                                    hit = True
-                                    break
-                                # URL 宽松匹配：full URL target vs 相对路径属性值
-                                if target_path and (
-                                    val_s == target_path
-                                    or val_s.rstrip("/") == target_path.rstrip("/")
-                                ):
-                                    hit = True
-                                    break
+                            if not isinstance(val, str):
+                                continue
+                            val_s = normalize(val.strip())
+                            if text_match(target, val_s, fuzz_ratio):
+                                hit = True
+                                break
+                            if target_path and val_s.rstrip("/") == target_path.rstrip("/"):
+                                hit = True
+                                break
                     if hit:
-                        # 只保留最小节点
-                        is_anc = any(
-                            node in list(sn.parents) for sn in seed_nodes
-                        )
-                        if not is_anc:
+                        # 只保留最内层节点（排除祖先）
+                        is_ancestor = any(node in list(sn.parents) for sn in seed_nodes)
+                        if not is_ancestor:
                             seed_nodes.append(node)
 
             if not seed_nodes:
-                logger.warning("alias='%s' 未找到正样本，跳过", alias)
+                logger.warning("alias='%s' ML 模式未找到种子节点，跳过", alias)
                 continue
 
-            # ★ 列表页关键：把结构相同的所有兄弟节点都标为正样本
+            # ── 扩展到同结构兄弟 ──
             positive_indices = self._expand_to_siblings(seed_nodes, all_nodes)
-
-            # 也把种子本身加进去（防止无兄弟的情况）
             for sn in seed_nodes:
                 if sn in all_nodes:
                     positive_indices.add(all_nodes.index(sn))
 
             logger.info(
-                "alias='%s' 训练中，%d 个种子 → 扩充到 %d 个正样本 / %d 个节点",
+                "alias='%s' ML 训练：%d 种子 → %d 正样本 / %d 总节点",
                 alias, len(seed_nodes), len(positive_indices), len(all_nodes),
             )
 
+            # ── 训练随机森林 ──
             vocab = None
             vecs = []
             for feat in all_features:
@@ -607,199 +427,198 @@ class AutoScraper(object):
             y = np.array([1 if i in positive_indices else 0 for i in range(len(all_nodes))])
 
             clf = RandomForestClassifier(
-                n_estimators=100, class_weight='balanced', random_state=42, n_jobs=-1
+                n_estimators=100, class_weight='balanced', random_state=42, n_jobs=-1,
             )
             clf.fit(X, y)
 
-            self._ml_classifiers[alias] = clf
-            self._ml_vocabs[alias] = vocab
-            self._ml_n_positives[alias] = len(positive_indices)
-
-    def _ml_get_result(self, soup, url=None, threshold=0.5, group_by_alias=False):
-        """用 ML 分类器在 soup 上预测，自动去除父子重复节点"""
-        all_nodes = [n for n in soup.find_all(True) if n.name]
-
-        # 预先算好所有节点的特征向量（各 alias 共用）
-        alias_results = {}
-
-        for alias, clf in self._ml_classifiers.items():
-            vocab = self._ml_vocabs[alias]
-            vecs = []
-            for node in all_nodes:
-                vec, _ = _features_to_vector(_extract_node_features(node, soup), vocab)
-                vecs.append(vec)
-
-            X = np.array(vecs)
-            expected = clf.n_features_in_
-            if X.shape[1] < expected:
-                X = np.hstack([X, np.zeros((X.shape[0], expected - X.shape[1]))])
-            elif X.shape[1] > expected:
-                X = X[:, :expected]
-
+            # ── 预测：找概率最高的代表节点 → 构建 stack ──
             proba = clf.predict_proba(X)
             pos_idx = list(clf.classes_).index(1) if 1 in clf.classes_ else 1
+            best_i = int(np.argmax(proba[:, pos_idx]))
+            representative = all_nodes[best_i]
 
-            # ★ 单样本模式：训练时只有1个正样本，直接取概率最高的1个节点
-            n_positive = self._ml_n_positives.get(alias, 0)
-            if n_positive == 1:
-                best_i = int(np.argmax(proba[:, pos_idx]))
-                hit_indices = [best_i]
-            else:
-                hit_indices = [i for i in range(len(all_nodes))
-                               if proba[i][pos_idx] >= threshold]
+            # 判断字段类型：如果样本是 URL，wanted_attr 设为 href
+            is_url_field = any(t.startswith("http") or t.startswith("/") for t in targets)
+            if is_url_field and representative.get("href"):
+                representative.wanted_attr = "href"
+            elif not hasattr(representative, "wanted_attr"):
+                representative.wanted_attr = None
 
-            hit_nodes = [all_nodes[i] for i in hit_indices]
+            stack = self._build_stack(representative, url)
+            stack["alias"] = alias
+            self.stack_list.append(stack)
 
-            # 判断该 alias 是否为 URL 字段
-            is_url_field = False
-            if hasattr(self, '_ml_wanted_dict') and alias in self._ml_wanted_dict:
-                samples = self._ml_wanted_dict[alias]
-                is_url_field = any(
-                    s.startswith("http") or s.startswith("/") for s in samples
-                )
+            xpath = self._stack_to_xpath(stack)
+            logger.info(
+                "alias='%s' ML → XPath: %s  (代表节点: <%s> prob=%.3f)",
+                alias, xpath, representative.name, proba[best_i][pos_idx],
+            )
 
-            def _node_text(node):
-                """节点的直接文本内容（用于去重判断）"""
-                from autoscraper.utils import get_non_rec_text
-                return get_non_rec_text(node) or node.get_text(strip=True)
+    def build_xpath(self, url=None, wanted_dict=None, html=None, **kwargs):
+        self.build(url=url, wanted_dict=wanted_dict, html=html, **kwargs)
+        return self.get_result_xpath_rule()
 
-            def _extract_val(node):
-                """从节点提取最终值（含属性回退）"""
-                if is_url_field:
-                    val = (node.get("href")
-                           or node.get("src")
-                           or node.get("data-src"))
-                    if val:
-                        return val
-                # 直接文本
-                from autoscraper.utils import get_non_rec_text
-                val = get_non_rec_text(node)
-                if val:
-                    return val
-                # 含子节点的完整文本
-                val = node.get_text(strip=True)
-                if val:
-                    return val
-                # 回退：常见属性
-                for attr in ("title", "aria-label", "alt", "data-name"):
-                    val = node.get(attr, "")
-                    if val and isinstance(val, str):
-                        return val.strip()
-                return ""
+    def get_result_xpath_rule(self, url=None):
+        if not self.stack_list: return {}
+        rules = {}
+        for stack in self.stack_list:
+            alias = stack.get("alias", "default")
+            if alias not in rules:
+                rules[alias] = self._stack_to_xpath(stack)
+        return rules
 
-            # 去重策略：基于直接文本判断父子保留关系
-            # 1) 有直接文本的节点优先保留
-            # 2) 祖先有直接文本 而 子节点没有 → 保留祖先
-            # 3) 都有或都没有 → 保留子节点（原行为）
-            hit_with_text = []
-            for i in hit_indices:
-                node = all_nodes[i]
-                text = _node_text(node)
-                hit_with_text.append((i, node, text))
+    def _stack_to_xpath(self, stack):
+        """将学习到的 stack 转换为精准 XPath 表达式。
 
-            removed = set()
-            for idx_a, node_a, text_a in hit_with_text:
-                if idx_a in removed:
-                    continue
-                for idx_b, node_b, text_b in hit_with_text:
-                    if idx_b in removed or idx_a == idx_b:
-                        continue
-                    # 检查 node_a 是否为 node_b 的祖先
-                    if any(id(p) == id(node_a) for p in node_b.parents):
-                        # node_a 是祖先，node_b 是子节点
-                        if text_b and text_a:
-                            removed.add(idx_a)  # 都有文本：保留子节点
-                        elif text_a and not text_b:
-                            removed.add(idx_b)  # 只有祖先有文本：保留祖先
-                        elif text_b and not text_a:
-                            removed.add(idx_a)  # 只有子节点有文本：保留子节点
-                        else:
-                            removed.add(idx_a)  # 都没有文本：保留子节点
+        策略：
+        - ID 锚点：遇到稳定 ID 时重置路径，且不再加 class（ID 已足够唯一）
+        - class 匹配：过滤 variant class（first/odd/active 等位置/状态类）后使用词边界匹配
+        - 位置谓词：用 tag-only 兄弟计数判断 is_repeating，避免 class-filtered count 偏低
+        - 路径类型：起始用 //，后续用 / 表示直接父子关系
 
-            leaf_hits = [
-                (all_nodes[i], proba[i][pos_idx])
-                for i in hit_indices
-                if i not in removed
-            ]
+        数据结构说明：
+        content[k] 可能是：
+          2-tuple (tag, attrs) — 叶子节点或无索引的层级
+          4-tuple (tag, attrs, child_index, child_sibling_count) — 旧格式中间层级
+          5-tuple (tag, attrs, child_index, child_sibling_count, tag_only_count) — 新格式
+        其中 child_index/child_sibling_count 描述 content[k+1] 在同类兄弟中的位置/总数
+        """
+        content = stack.get("content", [])
+        if not content:
+            return None
 
-            # 按 DOM 顺序排列
-            leaf_hits.sort(key=lambda x: all_nodes.index(x[0]))
+        xpath_parts = []
+        last_idx = len(content) - 1
 
+        for i, item in enumerate(content):
+            tag = item[0]
+            attrs = item[1] if len(item) > 1 else {}
+
+            if tag in ("html", "body", "[document]"):
+                continue
+
+            # ── 读取兄弟索引数据（存储在上一个 content 条目）──
+            sibling_idx = None
+            sibling_count = None       # class-filtered count
+            tag_only_count = None      # tag-only count（新增）
+            if i > 0:
+                prev = content[i - 1]
+                if len(prev) >= 4:
+                    sibling_idx = prev[2]
+                    sibling_count = prev[3]
+                if len(prev) >= 5:
+                    tag_only_count = prev[4]
+                else:
+                    tag_only_count = sibling_count  # 向后兼容
+
+            attr_predicates = []
+            has_id = False
+
+            # ── ID 谓词 ──
+            node_id = attrs.get("id", "")
+            if node_id and _is_stable_id(node_id):
+                attr_predicates.append(f"@id='{node_id}'")
+                has_id = True
+                xpath_parts = []  # ID 全局唯一，重置路径
+                # 有 ID 时不再加 class（ID 已足够唯一）
+
+            # ── class 谓词（仅无 ID 时）──
+            if not has_id:
+                classes = attrs.get("class", [])
+                if isinstance(classes, str):
+                    classes = classes.split()
+                # 过滤 variant class（first/odd/active 等位置/状态类）
+                classes = [c for c in classes if not _is_variant_class(c)]
+                for cls in classes:
+                    attr_predicates.append(
+                        f"contains(concat(' ',@class,' '),' {cls} ')"
+                    )
+
+            # ── 构造节点段 ──
+            part = tag
+            if attr_predicates:
+                part += "[" + " and ".join(attr_predicates) + "]"
+
+            # ── 位置谓词 ──
+            # 用 tag_only_count 判断是否为重复元素（比 class-filtered count 更准确）
+            is_leaf = (i == last_idx)
+            is_repeating = tag_only_count is not None and tag_only_count > 1
+            if sibling_idx is not None and not has_id and not is_leaf and not is_repeating:
+                part += f"[{sibling_idx + 1}]"
+
+            xpath_parts.append(part)
+
+        if not xpath_parts:
+            return None
+
+        xpath = "//" + "/".join(xpath_parts)
+
+        wanted_attr = stack.get("wanted_attr")
+        if wanted_attr:
+            xpath += f"/@{wanted_attr}"
+
+        return xpath
+
+    def get_result_similar(self, url=None, html=None, soup=None,
+                           group_by_alias=False, unique=True, **kwargs):
+        """用已学习的 XPath 规则在页面上提取数据。
+
+        Args:
+            url: 目标页面 URL
+            html: 目标页面 HTML 字符串
+            soup: 已解析的 BeautifulSoup 对象（会转为 lxml tree）
+            group_by_alias: True 返回 {alias: [values]}，False 返回扁平列表
+            unique: 是否去重（默认 True）
+
+        Returns:
+            dict | list: 提取结果
+        """
+        from lxml import html as lxml_html
+
+        rules = self.get_result_xpath_rule()
+        if not rules:
+            return {} if group_by_alias else []
+
+        # 与 build()/_get_soup() 保持一致的解析链:
+        # normalize + unescape → BS4(lxml) → str → lxml_html
+        # 避免 BS4 与 lxml 直接解析同一 HTML 产出不同 DOM 树导致 XPath 匹配失败
+        if html:
+            soup_obj = self._get_soup(html=html)
+            tree = lxml_html.fromstring(str(soup_obj))
+        elif url:
+            soup_obj = self._get_soup(url=url, request_args=kwargs.get("request_args"))
+            tree = lxml_html.fromstring(str(soup_obj))
+        elif soup:
+            tree = lxml_html.fromstring(str(soup))
+        else:
+            return {} if group_by_alias else []
+
+        results = defaultdict(list)
+        for alias, xpath in rules.items():
+            try:
+                nodes = tree.xpath(xpath)
+            except Exception as e:
+                logger.warning("XPath 执行失败 alias='%s' xpath='%s': %s", alias, xpath, e)
+                continue
+            skipped_empty = 0
+            skipped_dup = 0
             seen = set()
-            alias_results[alias] = []
-            for node, _ in leaf_hits:
-                val = _extract_val(node)
-                if val and val not in seen:
-                    seen.add(val)
-                    alias_results[alias].append(val)
+            for n in nodes:
+                val = n if isinstance(n, str) else n.text_content().strip()
+                if not val:
+                    skipped_empty += 1
+                    continue
+                if unique and val in seen:
+                    skipped_dup += 1
+                    continue
+                seen.add(val)
+                results[alias].append(val)
+            logger.debug(
+                "XPath alias='%s': matched=%d, kept=%d, empty=%d, dup=%d | xpath=...%s",
+                alias, len(nodes), len(results[alias]),
+                skipped_empty, skipped_dup, xpath[-80:],
+            )
 
         if group_by_alias:
-            return alias_results
-
-        # 合并所有 alias 结果（去重，保持顺序）
-        all_results, seen = [], set()
-        for items in alias_results.values():
-            for text in items:
-                if text not in seen:
-                    seen.add(text)
-                    all_results.append(text)
-        return all_results
-
-    # ── get_result_similar / exact / get_result（原版 + ML fallback）──
-
-    def get_result_similar(self, url=None, html=None, soup=None, request_args=None,
-                           grouped=False, group_by_alias=False, unique=None,
-                           attr_fuzz_ratio=1.0, keep_blank=False, keep_order=False,
-                           contain_sibling_leaves=False, ml_threshold=0.5):
-        """
-        原版参数完全兼容。新增：
-          ml_threshold: float = 0.5  - ML 模式下的分类器概率阈值
-        """
-        # ★ 如果 build() 启用了 ML 模式，走 ML 预测
-        if self._ml_active and self._ml_classifiers and _ML_AVAILABLE:
-            if not soup:
-                soup = self._get_soup(url=url, html=html, request_args=request_args)
-            return self._ml_get_result(soup, url=url, threshold=ml_threshold,
-                                       group_by_alias=group_by_alias)
-
-        # 否则走原版规则路径
-        func = self._get_result_with_stack
-        return self._get_result_by_func(
-            func, url, html, soup, request_args,
-            grouped, group_by_alias, unique, attr_fuzz_ratio,
-            keep_blank=keep_blank, keep_order=keep_order,
-            contain_sibling_leaves=contain_sibling_leaves,
-        )
-
-    def get_result_exact(self, url=None, html=None, soup=None, request_args=None,
-                         grouped=False, group_by_alias=False, unique=None,
-                         attr_fuzz_ratio=1.0, keep_blank=False):
-        func = self._get_result_with_stack_index_based
-        return self._get_result_by_func(
-            func, url, html, soup, request_args,
-            grouped, group_by_alias, unique, attr_fuzz_ratio,
-            keep_blank=keep_blank,
-        )
-
-    def get_result(self, url=None, html=None, request_args=None,
-                   grouped=False, group_by_alias=False, unique=None, attr_fuzz_ratio=1.0):
-        soup = self._get_soup(url=url, html=html, request_args=request_args)
-        args = dict(url=url, soup=soup, grouped=grouped, group_by_alias=group_by_alias,
-                    unique=unique, attr_fuzz_ratio=attr_fuzz_ratio)
-        return self.get_result_similar(**args), self.get_result_exact(**args)
-
-    # ── 规则管理（原版不变）──────────────────────────────
-
-    def remove_rules(self, rules):
-        self.stack_list = [x for x in self.stack_list if x["stack_id"] not in rules]
-
-    def keep_rules(self, rules):
-        self.stack_list = [x for x in self.stack_list if x["stack_id"] in rules]
-
-    def set_rule_aliases(self, rule_aliases):
-        id_to_stack = {stack["stack_id"]: stack for stack in self.stack_list}
-        for rule_id, alias in rule_aliases.items():
-            id_to_stack[rule_id]["alias"] = alias
-
-    def generate_python_code(self):
-        logger.warning("This function is deprecated. Please use save() and load() instead.")
+            return dict(results)
+        return [v for sub in results.values() for v in sub]

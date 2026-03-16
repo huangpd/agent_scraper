@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import logging
+import re
 import sys
 import threading
 from pathlib import Path
@@ -47,32 +48,55 @@ async def broadcast(task_id: str, event_type: str, data: dict):
             ws_connections[task_id].discard(ws)
 
 
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+_LOG_RE = re.compile(r'^(INFO|WARNING|ERROR|DEBUG)\s+\[([^\]]+)]\s*(.*)$')
+_SEPARATOR_RE = re.compile(r'^[\s─═\-*]{4,}$')
+
+
 class PrintCapture(io.TextIOBase):
-    """拦截 print() 输出，1:1 转发为 WebSocket log 事件，同时保留原始终端输出。"""
+    """拦截 print() 输出，strip ANSI + 结构化日志转发为 WebSocket log 事件，同时保留原始终端输出。"""
 
     def __init__(self, original_stdout, loop, manager_ref):
         self._original = original_stdout
         self._loop = loop
         self._manager = manager_ref
         self._task_id: str | None = None
+        self._recent_step_tools: set[str] = set()
 
     def bind(self, task_id: str):
         self._task_id = task_id
 
     def write(self, text: str):
-        self._original.write(text)
+        self._original.write(text)        # 终端原样输出
         if not self._task_id:
             return len(text)
         line = text.rstrip("\n\r")
         if not line:
             return len(text)
+
+        clean = _ANSI_RE.sub('', line).strip()
+        if not clean or _SEPARATOR_RE.match(clean):
+            return len(text)
+
+        # 去重：如果日志内容与最近 step 事件重复，跳过
+        if self._recent_step_tools:
+            for tool_name in self._recent_step_tools:
+                if tool_name and tool_name in clean:
+                    return len(text)
+
+        m = _LOG_RE.match(clean)
+        if m:
+            msg_data = {"level": m.group(1).lower(), "module": m.group(2), "message": m.group(3)}
+        else:
+            msg_data = {"level": "info", "module": "", "message": clean}
+
+        event = {"type": "log", "data": msg_data}
         info = self._manager.get(self._task_id)
         if info:
-            event = {"type": "log", "data": {"message": line}}
             info.events.append(event)
             try:
                 self._loop.create_task(
-                    broadcast(self._task_id, "log", {"message": line})
+                    broadcast(self._task_id, "log", msg_data)
                 )
             except RuntimeError:
                 pass
@@ -138,6 +162,8 @@ async def create_task(req: CreateTaskRequest):
 
         try:
             def on_event(event_type: str, data: dict):
+                if event_type == "step":
+                    capture._recent_step_tools.add(data.get("tool", ""))
                 info.events.append({"type": event_type, "data": data})
                 loop.create_task(broadcast(task_id, event_type, data))
 
@@ -154,6 +180,8 @@ async def create_task(req: CreateTaskRequest):
             info.error = str(e)
             await broadcast(task_id, "error", {"message": str(e)})
         finally:
+            # 先解绑 PrintCapture，避免浏览器清理阶段的噪音日志转发到前端
+            capture._task_id = None
             # 恢复所有被劫持的 StreamHandler 输出流
             for h, original_stream in saved_streams:
                 h.stream = original_stream
@@ -185,6 +213,22 @@ async def get_task(task_id: str):
 async def cancel_task(task_id: str):
     ok = manager.cancel(task_id)
     return {"cancelled": ok}
+
+
+@app.post("/api/stop-all")
+async def stop_all():
+    """终止所有任务，关闭所有 WebSocket，重置为全新环境。"""
+    cancelled = manager.cancel_all()
+    # 关闭所有 WebSocket 连接
+    for task_id, sockets in list(ws_connections.items()):
+        for ws in list(sockets):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        sockets.clear()
+    ws_connections.clear()
+    return {"cancelled": cancelled}
 
 
 @app.websocket("/ws/{task_id}")

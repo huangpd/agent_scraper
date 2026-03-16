@@ -23,7 +23,8 @@ PARSE_PROMPT = """\
     "fields": {{"字段名": "字段描述", ...}},
     "output_format": "json|csv",
     "url_pattern": "可选的URL构造模板，用{{字段名}}作为占位符，没有则为null",
-    "traversal_hints": ["用户要求的遍历模式列表"]
+    "traversal_hints": ["用户要求的遍历模式列表"],
+    "max_pages": null
   }}
 }}
 
@@ -50,6 +51,12 @@ traversal_hints 从用户指令中识别遍历意图（数组，可多选）:
 - "pagination": 用户提到"翻页"、"所有页"、"每一页"等
 - "next_button": 用户提到"下一页"等
 - 如果用户没有提到任何遍历需求，返回空数组 []
+
+max_pages: 用户指定的最大页数限制（整数），没有则为 null：
+- "翻到第3页停止" → 3
+- "只取前5页" → 5
+- "翻页，最多10页" → 10
+- 没有提到页数限制 → null
 
 分析规则：
 1. navigation_steps 只包含到达目标页面的步骤（打开URL、点击标签等）
@@ -98,12 +105,17 @@ class TaskParser:
         mode = data.get("mode", "extract")
         mode = self._ensure_mode(mode, instruction)
 
+        # LLM 识别页数限制 + 正则兜底
+        max_pages = goal_data.get("max_pages")
+        max_pages = self._ensure_max_pages(max_pages, instruction)
+
         goal = ExtractionGoal(
             fields=goal_data["fields"],
             output_format=goal_data.get("output_format", "json"),
             url_pattern=goal_data.get("url_pattern"),
             samples=samples if samples else None,
             traversal_hints=hints,
+            max_pages=max_pages,
         )
 
         return ParsedTask(
@@ -142,6 +154,25 @@ class TaskParser:
         if any(kw in text for kw in capture_keywords):
             return "capture"
         return mode
+
+    @staticmethod
+    def _ensure_max_pages(max_pages: int | None, instruction: str) -> int | None:
+        """正则兜底：从指令中提取用户指定的最大页数"""
+        if max_pages:
+            return max_pages
+        # 匹配常见模式: "第3页停止", "前5页", "最多10页", "翻3页"
+        patterns = [
+            r'第\s*(\d+)\s*页.*?停',       # 翻到第3页停止
+            r'前\s*(\d+)\s*页',             # 只取前5页
+            r'最多\s*(\d+)\s*页',           # 最多10页
+            r'翻\s*(\d+)\s*页',             # 翻3页
+            r'(\d+)\s*页.*?(?:为止|即可|就行|够了|停止)',  # 3页为止
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, instruction)
+            if m:
+                return int(m.group(1))
+        return None
 
     @staticmethod
     def _extract_samples(instruction: str) -> dict[str, list[str]] | None:

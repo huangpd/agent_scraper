@@ -55,12 +55,16 @@ src/
 │   ├── core/                   # 基础层
 │   │   ├── models.py           # 数据模型 → 修改字段/新增模型从这里开始
 │   │   └── llm.py              # LLM 客户端工厂 → 修改 API 配置
-│   ├── pipeline/               # 编排层
-│   │   ├── orchestrator.py     # Pipeline 编排 → 调整步骤顺序/新增步骤
-│   │   └── task_parser.py      # 指令解析 → 修改 Prompt / 新增 action 类型
+│   ├── pipeline/               # 编排层（ReAct 循环）
+│   │   ├── orchestrator.py     # 组装 Tools + Reasoner → 调整组件组合
+│   │   ├── task_parser.py      # 指令解析 → 修改 Prompt / 新增 action 类型
+│   │   ├── context.py          # 共享上下文 AgentContext → 新增/修改状态字段
+│   │   ├── tools.py            # Tool 实现 → 新增/修改 Tool
+│   │   ├── reasoner.py         # ReAct 推理循环 → 调整计划/重试策略
+│   │   └── evaluator.py        # 结果评估器 → 调整评估标准
 │   ├── browser/                # 浏览器层
 │   │   ├── navigator.py        # 浏览器导航 + 图片参考 → 修改 Agent 行为
-│   │   └── page_iterator.py    # 页面遍历 → 新增遍历执行逻辑
+│   │   └── page_iterator.py    # 页面遍历（流式 AsyncGenerator）→ 新增遍历模式
 │   └── extraction/             # 提取层
 │       ├── rule_discoverer.py  # 规则发现 → 新增遍历模式
 │       ├── extractor.py        # 数据提取 → 调整降级策略/Prompt
@@ -152,7 +156,11 @@ checks = {
 
 **步骤 4**：`browser/page_iterator.py` — 在 `iterate()` 中添加执行逻辑
 
+> 注意：`iterate()` 是 `AsyncGenerator`，新增遍历模式应使用 `yield html` 逐页产出 HTML，而非返回列表。子方法也应实现为 async generator。
+
 **步骤 5**：添加测试
+
+> 测试中使用 `[h async for h in iterator.iterate(...)]` 来收集 async generator 的结果。
 
 ### 4.2 新增提取输出格式
 

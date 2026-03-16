@@ -69,7 +69,7 @@ class TestIterate:
         page.evaluate = AsyncMock(side_effect=["not_found", "<html>updated</html>"])
 
         rules = PageRules()
-        htmls = await iterator.iterate("<html>first</html>", rules, "https://example.com")
+        htmls = [h async for h in iterator.iterate("<html>first</html>", rules, "https://example.com")]
         assert len(htmls) == 1
 
     @pytest.mark.asyncio
@@ -87,7 +87,7 @@ class TestIterate:
         page.evaluate = mock_eval
 
         rules = PageRules(pagination_url="https://example.com/page/{n}", pagination_max=3)
-        htmls = await iterator.iterate("<html>page1</html>", rules, "")
+        htmls = [h async for h in iterator.iterate("<html>page1</html>", rules, "")]
         # page1 + page2 + page3
         assert len(htmls) >= 1
 
@@ -110,7 +110,7 @@ class TestIterate:
         page.evaluate = mock_eval
 
         rules = PageRules(next_button_selector="a.next-page")
-        htmls = await iterator.iterate("<html>page1</html>", rules, "")
+        htmls = [h async for h in iterator.iterate("<html>page1</html>", rules, "")]
         assert len(htmls) >= 1
 
 
