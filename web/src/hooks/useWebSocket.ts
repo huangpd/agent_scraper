@@ -26,16 +26,24 @@ export function useWebSocket() {
         case 'step':
           setMessages(prev => [...prev, {
             id, type: 'step', timestamp,
-            content: `步骤 ${event.data.step}: ${event.data.name}`,
+            content: event.data.summary
+              ? `${event.data.tool} — ${event.data.summary}`
+              : `${event.data.tool} [${event.data.status}]`,
             data: event.data,
           }])
           break
-        case 'log':
+        case 'log': {
+          const level = (event.data.level as string) || 'info'
+          const module = (event.data.module as string) || ''
+          const message = (event.data.message as string) || ''
+          if (!message.trim()) break
           setMessages(prev => [...prev, {
             id, type: 'system', timestamp,
-            content: event.data.message as string,
+            content: message,
+            data: { level, module },
           }])
           break
+        }
         case 'progress':
           // 就地更新最后一条 progress，不追加新气泡
           setMessages(prev => {
@@ -66,12 +74,16 @@ export function useWebSocket() {
             id, type: 'error', timestamp,
             content: event.data.message as string,
           }])
+          // 任务出错，自动断开
+          ws.close()
           break
         case 'done':
           setMessages(prev => [...prev, {
             id, type: 'system', timestamp,
             content: '✓ 任务完成',
           }])
+          // 任务完成，自动断开
+          ws.close()
           break
       }
     }
@@ -91,9 +103,13 @@ export function useWebSocket() {
     }])
   }, [])
 
+  const clearMessages = useCallback(() => {
+    setMessages([])
+  }, [])
+
   useEffect(() => {
     return () => { wsRef.current?.close() }
   }, [])
 
-  return { messages, connected, connect, disconnect, addUserMessage }
+  return { messages, connected, connect, disconnect, addUserMessage, clearMessages }
 }

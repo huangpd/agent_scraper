@@ -7,11 +7,15 @@ import asyncio
 import json as json_mod
 import logging
 import re
+from collections.abc import AsyncGenerator
 from urllib.parse import urljoin, urlparse
 
 from agent_scraper.core.models import PageRules
 
 logger = logging.getLogger(__name__)
+
+# 未指定 max_pages 时的默认翻页上限（pagination_url 和 next_button 共用）
+DEFAULT_MAX_PAGES = 20
 
 
 class PageIterator:
@@ -40,54 +44,50 @@ class PageIterator:
     async def _get_html(self) -> str:
         return await self._eval("() => document.documentElement.outerHTML")
 
-    async def iterate(self, first_html: str, rules: PageRules, base_url: str = "") -> list[str]:
-        """根据规则遍历所有页面，返回 HTML 列表"""
-        htmls = []
+    async def iterate(self, first_html: str, rules: PageRules, base_url: str = "") -> AsyncGenerator[str, None]:
+        """根据规则遍历所有页面，逐页 yield HTML（流式，不缓存）"""
+        max_pages = rules.pagination_max
 
-        # 1. load_more: 在当前页循环点击
+        # 1. load_more: 仅在有明确选择器时执行（避免误点击无关按钮）
         if rules.load_more_selector:
             await self._try_load_more(rules.load_more_selector)
-            first_html = await self._get_html()
-        else:
-            # 即使没有特定选择器，也尝试通用 Load more
-            await self._try_load_more(None)
             first_html = await self._get_html()
 
         # 2. sub_pages: 递归遍历子页面
         if rules.sub_page_selector:
-            htmls.append(first_html)
-            sub_htmls = await self._do_sub_pages(
+            yield first_html
+            async for html in self._do_sub_pages(
                 selector=rules.sub_page_selector,
                 url_attr=rules.sub_page_url_attr,
                 url_filter=rules.sub_page_url_filter,
                 load_more_selector=rules.load_more_selector,
                 base_url=base_url,
-            )
-            htmls.extend(sub_htmls)
+            ):
+                yield html
 
         # 3. pagination URL 模式
         elif rules.pagination_url:
-            htmls.append(first_html)
-            htmls.extend(await self._do_pagination_url(rules.pagination_url, rules.pagination_max or 20))
+            yield first_html
+            async for html in self._do_pagination_url(rules.pagination_url, max_pages or DEFAULT_MAX_PAGES):
+                yield html
 
         # 4. next_button 翻页
         elif rules.next_button_selector:
-            htmls.append(first_html)
-            htmls.extend(await self._do_next_button(rules.next_button_selector))
+            yield first_html
+            async for html in self._do_next_button(rules.next_button_selector, max_pages):
+                yield html
 
         # 5. 无规则: 单页
         else:
-            htmls.append(first_html)
-
-        logger.info("共收集 %d 个页面的 HTML", len(htmls))
-        return htmls
+            yield first_html
 
     # ── load_more ────────────────────────────────────────
 
-    async def _try_load_more(self, selector: str | None):
+    async def _try_load_more(self, selector: str | None, max_clicks: int = 50):
         """尝试点击 Load more 按钮。有选择器用选择器，没有用通用文本匹配"""
         click_count = 0
-        while True:
+        prev_height = 0
+        while click_count < max_clicks:
             js = self._build_load_more_js(selector)
             result = await self._eval(js)
             if result != "clicked":
@@ -96,7 +96,15 @@ class PageIterator:
             if click_count % 5 == 0:
                 logger.info("load_more 已点击 %d 次...", click_count)
             await asyncio.sleep(1.5)
-        if click_count > 0:
+            # 检测页面是否有变化（防止按钮始终可见的死循环）
+            cur_height = await self._eval("() => document.body.scrollHeight")
+            if cur_height == prev_height:
+                logger.info("load_more 页面无变化，停止")
+                break
+            prev_height = cur_height
+        if click_count >= max_clicks:
+            logger.warning("load_more 达到上限 %d 次，停止", max_clicks)
+        elif click_count > 0:
             logger.info("load_more 完成，共点击 %d 次", click_count)
 
     @staticmethod
@@ -141,16 +149,14 @@ class PageIterator:
         visited: set | None = None,
         depth: int = 0,
         max_depth: int = 5,
-    ) -> list[str]:
-        """递归提取子页面链接，逐个进入，收集 HTML。自动检测更深层子页面。"""
+    ) -> AsyncGenerator[str, None]:
+        """递归提取子页面链接，逐个进入，yield HTML。自动检测更深层子页面。"""
         if visited is None:
             visited = set()
 
         if depth >= max_depth:
             logger.warning("达到最大递归深度 %d，停止", max_depth)
-            return []
-
-        indent = "  " * (depth + 1)
+            return
 
         # 提取当前页的子页面链接
         urls = await self._extract_links(selector, url_attr, base_url)
@@ -172,11 +178,10 @@ class PageIterator:
                 logger.info("自动排除 %d 个文件链接", filtered_out)
 
         if not urls:
-            return []
+            return
 
         logger.info("发现 %d 个子页面 (depth=%d)", len(urls), depth)
 
-        htmls = []
         for i, url in enumerate(urls):
             if url in visited:
                 continue
@@ -189,10 +194,10 @@ class PageIterator:
                 await self._try_load_more(load_more_selector)
 
                 html = await self._get_html()
-                htmls.append(html)
+                yield html
 
                 # 递归：检查这个子页面里是否还有更深层子页面
-                deeper = await self._do_sub_pages(
+                async for deeper_html in self._do_sub_pages(
                     selector=selector,
                     url_attr=url_attr,
                     url_filter=url_filter,
@@ -201,13 +206,11 @@ class PageIterator:
                     visited=visited,
                     depth=depth + 1,
                     max_depth=max_depth,
-                )
-                htmls.extend(deeper)
+                ):
+                    yield deeper_html
 
             except Exception as e:
                 logger.error("子页面 [%d] 失败: %s", i + 1, e)
-
-        return htmls
 
     # 常见文件扩展名
     _FILE_EXTENSIONS = re.compile(
@@ -269,10 +272,10 @@ class PageIterator:
 
     # ── pagination URL ───────────────────────────────────
 
-    async def _do_pagination_url(self, url_pattern: str, max_pages: int) -> list[str]:
-        logger.info("URL 分页: max=%d", max_pages)
-        htmls = []
-        for n in range(2, max_pages + 1):
+    async def _do_pagination_url(self, url_pattern: str, max_pages: int) -> AsyncGenerator[str, None]:
+        """URL 模板分页。max_pages 为总页数（含第1页）。"""
+        logger.info("URL 分页: max=%d 页", max_pages)
+        for n in range(2, max_pages + 1):  # 第1页已有，从第2页开始
             url = url_pattern.replace("{n}", str(n))
             try:
                 await self._goto(url)
@@ -280,21 +283,23 @@ class PageIterator:
                 if len(html) < 1000:
                     logger.info("第 %d 页内容过少，停止", n)
                     break
-                htmls.append(html)
+                yield html
                 if n % 5 == 0:
                     logger.info("已完成 %d 页...", n)
             except Exception as e:
                 logger.error("分页 %d 失败: %s，停止", n, e)
                 break
-        return htmls
 
     # ── next_button ──────────────────────────────────────
 
-    async def _do_next_button(self, selector: str) -> list[str]:
-        logger.info("翻页按钮: %s", selector)
+    async def _do_next_button(self, selector: str, max_pages: int | None = None) -> AsyncGenerator[str, None]:
+        """点击"下一页"翻页。max_pages 为总页数限制（含第1页），None 则不限制。"""
+        # max_extra = 需要额外翻的页数（第1页已有，所以减1）
+        max_extra = (max_pages - 1) if max_pages else DEFAULT_MAX_PAGES
+        logger.info("翻页按钮: %s (最多翻 %d 页)", selector, max_extra)
         safe_sel = selector.replace("'", "\\'")
-        htmls = []
-        for i in range(100):
+        page_count = 0
+        for i in range(max_extra):
             result = await self._eval(
                 f"() => {{"
                 f"  const btn = document.querySelector('{safe_sel}');"
@@ -305,8 +310,8 @@ class PageIterator:
             if result != "clicked":
                 break
             await asyncio.sleep(2)
-            htmls.append(await self._get_html())
+            yield await self._get_html()
+            page_count += 1
             if (i + 1) % 5 == 0:
                 logger.info("已翻 %d 页...", i + 1)
-        logger.info("翻页完成，共 %d 个额外页面", len(htmls))
-        return htmls
+        logger.info("翻页完成，共 %d 个额外页面", page_count)

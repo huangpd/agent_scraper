@@ -1,6 +1,11 @@
 """测试 orchestrator 事件回调机制
-orchestrator 只 emit 三种事件: progress, result, error
-其余日志通过 print() 输出（由 server 的 PrintCapture 转发到前端）
+
+新架构事件模型:
+- "step"     : Reasoner 每执行一个 Tool 时发出
+- "evaluate" : Evaluator 完成评估后发出
+- "progress" : IteratePagesTool 每提取一页时发出
+- "result"   : Reasoner 完成后发出最终结果
+- "error"    : 异常时由 orchestrator 发出
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,6 +18,12 @@ from agent_scraper.core.models import (
     ParsedTask,
     ScrapedResult,
 )
+from agent_scraper.pipeline.evaluator import EvalResult
+
+
+async def _async_gen(items):
+    for item in items:
+        yield item
 
 
 def _make_mocks():
@@ -23,6 +34,7 @@ def _make_mocks():
         extraction_goal=ExtractionGoal(
             fields={"name": "文件名", "url": "链接"},
             traversal_hints=["load_more"],
+            samples={"name": ["a.txt"], "url": ["/a.txt"]},
         ),
         raw_instruction="test",
     )
@@ -42,33 +54,40 @@ def _make_mocks():
 def _patch_all():
     return (
         patch("agent_scraper.core.llm.create_openai_client"),
+        patch("agent_scraper.core.llm.get_model_name", return_value="test-model"),
         patch("agent_scraper.pipeline.orchestrator.TaskParser"),
         patch("agent_scraper.pipeline.orchestrator.Navigator"),
         patch("agent_scraper.pipeline.orchestrator.RuleDiscoverer"),
         patch("agent_scraper.pipeline.orchestrator.Extractor"),
         patch("agent_scraper.pipeline.orchestrator.Formatter"),
-        patch("agent_scraper.pipeline.orchestrator.PageIterator"),
+        patch("agent_scraper.pipeline.orchestrator.Evaluator"),
+        patch("agent_scraper.browser.page_iterator.PageIterator"),
     )
 
 
 def _setup_mocks(patches, mock_task, mock_nav_result, mock_result, pages=None):
-    (_, MockParser, MockNav, MockRuleDisc,
-     MockExtractor, MockFormatter, MockPageIter) = [p.start() for p in patches]
+    (_, _, MockParser, MockNav, MockRuleDisc,
+     MockExtractor, MockFormatter, MockEvaluator, MockPageIter) = [p.start() for p in patches]
 
     MockParser.return_value.parse = AsyncMock(return_value=mock_task)
     MockNav.return_value.navigate = AsyncMock(return_value=mock_nav_result)
     MockRuleDisc.return_value.discover = AsyncMock(return_value=PageRules())
-    MockPageIter.return_value.iterate = AsyncMock(return_value=pages or ["<html/>"])
-    MockExtractor.return_value.extract = AsyncMock(return_value={"name": ["x"]})
+    MockPageIter.return_value.iterate = MagicMock(
+        return_value=_async_gen(pages or ["<html/>"])
+    )
+    MockExtractor.return_value.extract = AsyncMock(return_value={"name": ["x"], "url": ["/x"]})
     MockFormatter.return_value.format = AsyncMock(return_value=mock_result)
+    MockEvaluator.return_value.evaluate = AsyncMock(
+        return_value=EvalResult(passed=True, field_check=True, quality_score=0.95)
+    )
 
-    return MockRuleDisc
+    return MockParser
 
 
 class TestEventCallback:
     @pytest.mark.asyncio
-    async def test_emits_progress_and_result(self):
-        """on_event 应收到 progress 和 result 事件"""
+    async def test_emits_step_and_result(self):
+        """on_event 应收到 step、evaluate、progress 和 result 事件"""
         mock_task, mock_nav_result, mock_result = _make_mocks()
         events = []
         patches = _patch_all()
@@ -83,11 +102,10 @@ class TestEventCallback:
                 p.stop()
 
         event_types = [e[0] for e in events]
-        assert "progress" in event_types
-        assert "result" in event_types
-        # step/log 不再 emit，由 print 输出
-        assert "step" not in event_types
-        assert "log" not in event_types
+        assert "step" in event_types       # Reasoner 每步发出
+        assert "result" in event_types     # 最终结果
+        assert "progress" in event_types   # ExtractTool 每页发出
+        assert "evaluate" in event_types   # Evaluator 结果
 
     @pytest.mark.asyncio
     async def test_progress_events_for_multiple_pages(self):
@@ -108,17 +126,19 @@ class TestEventCallback:
 
         progress_events = [e[1] for e in events if e[0] == "progress"]
         assert len(progress_events) == 3
-        assert progress_events[0] == {"current": 1, "total": 3}
-        assert progress_events[2] == {"current": 3, "total": 3}
+        # 流式模式下 total 未知（0）
+        assert progress_events[0] == {"current": 1, "total": 0}
+        assert progress_events[2] == {"current": 3, "total": 0}
 
     @pytest.mark.asyncio
     async def test_error_event_on_exception(self):
-        """异常时应发出 error 事件"""
+        """解析阶段异常时应发出 error 事件"""
         mock_task, mock_nav_result, _ = _make_mocks()
         events = []
         patches = _patch_all()
-        MockRuleDisc = _setup_mocks(patches, mock_task, mock_nav_result, None)
-        MockRuleDisc.return_value.discover = AsyncMock(side_effect=RuntimeError("boom"))
+        MockParser = _setup_mocks(patches, mock_task, mock_nav_result, None)
+        # TaskParser 在 Reasoner 之前执行，异常会直接传播
+        MockParser.return_value.parse = AsyncMock(side_effect=RuntimeError("boom"))
 
         try:
             from agent_scraper.pipeline.orchestrator import AgentScraper
@@ -173,22 +193,24 @@ class TestEventCallback:
                 p.stop()
 
     @pytest.mark.asyncio
-    async def test_log_output_contains_all_steps(self, caplog):
-        """日志应包含所有 6 个步骤"""
-        import logging
+    async def test_step_events_include_tool_names(self):
+        """step 事件应包含每个 Tool 的名称"""
         mock_task, mock_nav_result, mock_result = _make_mocks()
+        events = []
         patches = _patch_all()
         _setup_mocks(patches, mock_task, mock_nav_result, mock_result)
 
         try:
             from agent_scraper.pipeline.orchestrator import AgentScraper
-            with caplog.at_level(logging.INFO, logger="agent_scraper.pipeline.orchestrator"):
-                scraper = AgentScraper(headless=True)
-                await scraper.run("test")
+            scraper = AgentScraper(headless=True, on_event=lambda t, d: events.append((t, d)))
+            await scraper.run("test")
         finally:
             for p in patches:
                 p.stop()
 
-        output = caplog.text
-        for step_num in range(1, 7):
-            assert f"步骤{step_num}" in output
+        step_events = [e[1] for e in events if e[0] == "step"]
+        tool_names = {e["tool"] for e in step_events}
+        # extract 模式应包含这些 tool
+        assert "navigate" in tool_names
+        assert "discover_rules" in tool_names
+        assert "extract" in tool_names

@@ -9,7 +9,7 @@ import logging
 import os
 import re
 
-from browser_use import Agent, Browser, BrowserProfile
+from browser_use import ActionResult, Agent, Browser, BrowserProfile, Tools
 from browser_use.llm import ChatOpenAI
 from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL
 
@@ -64,6 +64,9 @@ class Navigator:
             browser_profile=BrowserProfile(
                 headless=self.headless,
                 wait_between_actions=1.0,
+                # SPA 页面（React/Vue/Angular）需要更长的 JS 渲染时间
+                minimum_wait_page_load_time=3.0,
+                wait_for_network_idle_page_load_time=2.0,
             ),
             keep_alive=True,
         )
@@ -77,7 +80,7 @@ class Navigator:
         )
 
     async def _run_agent(self, task_text: str, images: list[str] | None = None,
-                         max_steps: int | None = None):
+                         max_steps: int | None = None, tools: Tools | None = None):
         """创建 browser + llm + Agent 并执行，返回 (browser, agent_history)。"""
         browser = self._create_browser()
         llm = self._create_llm()
@@ -85,9 +88,16 @@ class Navigator:
         if sample_images:
             task_text += _IMAGE_HINT
         logger.info("Agent 任务:\n%s", task_text)
-        agent = Agent(task=task_text, llm=llm, browser=browser, sample_images=sample_images)
+        agent_kwargs = dict(task=task_text, llm=llm, browser=browser, sample_images=sample_images)
+        if tools:
+            agent_kwargs["tools"] = tools
+        agent = Agent(**agent_kwargs)
         run_kwargs = {"max_steps": max_steps} if max_steps else {}
-        history = await agent.run(**run_kwargs)
+        try:
+            history = await agent.run(**run_kwargs)
+        except Exception:
+            await browser.stop()
+            raise
         return browser, history
 
     async def navigate(
@@ -116,15 +126,39 @@ class Navigator:
         raw_instruction: str = "",
         images: list[str] | None = None,
     ) -> CaptureResult:
-        """Capture 模式：导航 + 直接捕获字段值。"""
+        """Capture 模式：导航 + 用自定义工具直接捕获字段值。"""
+        # 用闭包收集 capture_values 工具的结果
+        captured_data: dict[str, str] = {}
+
+        tools = Tools()
+
+        @tools.action(description=f"保存从页面捕获的字段值。必须包含以下字段: {', '.join(fields.keys())}")
+        def capture_values(**kwargs) -> ActionResult:
+            for k in fields:
+                val = kwargs.get(k, "")
+                if val:
+                    captured_data[k] = str(val)
+            logger.info("[capture_values] 工具调用，捕获: %s", captured_data)
+            return ActionResult(
+                extracted_content=json.dumps(captured_data, ensure_ascii=False),
+                is_done=True,
+                success=True,
+            )
+
         if raw_instruction:
             task_text = raw_instruction.strip() + "\n\n" + self._capture_suffix(fields)
         else:
             task_text = self._format_steps(steps) + "\n\n" + self._capture_suffix(fields)
 
-        browser, history = await self._run_agent(task_text, images, max_steps=25)
+        browser, history = await self._run_agent(task_text, images, max_steps=25, tools=tools)
 
-        captured = self._parse_capture_result(history, fields)
+        # 优先用自定义工具的结构化结果
+        captured = captured_data if captured_data else {}
+
+        # Fallback: Agent 可能没调 capture_values 而是用了 done，从历史中解析
+        if not captured:
+            captured = self._parse_capture_result(history, fields)
+
         page_url = await browser.get_current_page_url()
         if not captured:
             captured = self._fallback_capture_from_url(page_url, fields)
@@ -151,23 +185,21 @@ class Navigator:
 
     @staticmethod
     def _capture_suffix(fields: dict[str, str]) -> str:
-        """生成 capture 模式的尾部指令（读取字段 + done）。"""
+        """生成 capture 模式的尾部指令（引导使用 capture_values 工具）。"""
         fields_list = "\n".join(f"  - {k}: {v}" for k, v in fields.items())
-        json_example = json.dumps({k: f"<{v}>" for k, v in fields.items()}, ensure_ascii=False)
+        json_example = ", ".join(f'{k}="<{v}>"' for k, v in fields.items())
         return f"""完成上述操作后，从页面上读取以下值:
 {fields_list}
 
-重要：获取到值后，立刻调用 done 动作完成任务。
-在 done 的 text 参数中填入 JSON 格式的结果，例如:
-{json_example}"""
+重要：获取到值后，立刻调用 capture_values 工具保存结果。
+调用方式: capture_values({json_example})
+不要使用 done 动作，必须使用 capture_values 工具。"""
+
+    # ── Fallback 解析（Agent 未调用自定义工具时降级）────
 
     @staticmethod
     def _parse_capture_result(history, fields: dict[str, str]) -> dict[str, str]:
-        """从 Agent 执行历史中提取捕获的值。
-        优先从 final_result（done 动作）提取 JSON，
-        如果 Agent 没有正确 done，则从所有 extracted_content 中搜索。
-        """
-        # 收集所有可能包含结果的文本（final_result 优先）
+        """从 Agent 执行历史中提取捕获的值（fallback）。"""
         texts = []
 
         if history and hasattr(history, "final_result"):
@@ -175,7 +207,6 @@ class Navigator:
             if fr:
                 texts.append(fr)
 
-        # 从所有步骤的 extracted_content 收集（倒序，最新的优先）
         if history and hasattr(history, "history"):
             for h in reversed(history.history):
                 if hasattr(h, "result"):
@@ -186,13 +217,12 @@ class Navigator:
         if not texts:
             texts.append(str(history) if history else "")
 
-        # 策略1: 从文本中尝试提取 JSON 对象
         for text in texts:
             captured = _extract_json_fields(text, fields)
             if captured:
                 return captured
 
-        # 策略2: 从文本中直接匹配 URL（兜底，应对 Agent 反复 extract 但不 done 的情况）
+        # URL 正则兜底
         url_fields = {k for k, v in fields.items()
                       if any(kw in k.lower() or kw in v.lower()
                              for kw in ("url", "链接", "link", "地址"))}
@@ -200,14 +230,10 @@ class Navigator:
             for text in texts:
                 urls = re.findall(r'https?://\S+', text)
                 if urls:
-                    captured = {}
-                    # 取最长的 URL（通常是完整的下载链接）
                     best_url = max(urls, key=len)
-                    for k in url_fields:
-                        captured[k] = best_url
-                    if captured:
-                        logger.info("从 extract 历史中匹配到 URL: %s...", best_url[:80])
-                        return captured
+                    captured = {k: best_url for k in url_fields}
+                    logger.info("从历史中匹配到 URL: %s...", best_url[:80])
+                    return captured
 
         return {}
 

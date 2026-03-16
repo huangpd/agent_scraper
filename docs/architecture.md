@@ -8,7 +8,7 @@
        ▼
 ┌─────────────────────────────────────────────────┐
 │                  AgentScraper                    │
-│                 (Orchestrator)                   │
+│           (Orchestrator + ReAct 循环)            │
 │                                                  │
 │  ┌───────────┐   ┌────────────┐   ┌───────────┐ │
 │  │TaskParser  │──▶│ Navigator  │──▶│   Rule    │ │
@@ -17,22 +17,33 @@
 │  └───────────┘   └────────────┘   └─────┬─────┘ │
 │                                         │       │
 │                                         ▼       │
-│                  ┌────────────┐   ┌───────────┐ │
-│                  │ Extractor  │◀──│   Page    │ │
-│                  │(CSS+ML+LLM│   │ Iterator  │ │
-│                  │ 三级降级)  │   │(代码遍历) │ │
-│                  └──────┬─────┘   └───────────┘ │
-│                         │                       │
-│                         ▼                       │
-│                  ┌────────────┐                  │
-│                  │ Formatter  │                  │
-│                  │(格式化输出)│                  │
-│                  └────────────┘                  │
+│                                   ┌───────────┐ │
+│                                   │   Page    │ │
+│                                   │ Iterator  │ │
+│                                   │(代码遍历) │ │
+│                                   └─────┬─────┘ │
+│                                  yield 每页 HTML │
+│                                         │       │
+│                                         ▼       │
+│                                   ┌───────────┐ │
+│                                   │ Extractor │ │
+│                                   │(CSS+ML+LLM│ │
+│                                   │ 三级降级) │ │
+│                                   └─────┬─────┘ │
+│                                  丢弃 HTML      │
+│                                         │       │
+│                                         ▼       │
+│                                   ┌───────────┐ │
+│                                   │ Formatter │ │
+│                                   │(格式化输出)│ │
+│                                   └───────────┘ │
 └─────────────────────────────────────────────────┘
        │
        ▼
   ScrapedResult (JSON/CSV)
 ```
+
+> **流式架构**：PageIterator 以 AsyncGenerator 逐页 yield HTML，IteratePagesTool 内联调用 Extractor 提取后立即丢弃 HTML。内存中始终只保留 1 页 HTML + 累积的结构化数据。
 
 ## 2. 核心模块
 
@@ -45,9 +56,11 @@
 | 1 | TaskParser | 自然语言指令 | ParsedTask | 是 |
 | 2 | Navigator | NavigationStep[] | browser + HTML | 是 (Agent) |
 | 3 | RuleDiscoverer | HTML + traversal_hints | PageRules | 条件性 |
-| 4 | PageIterator | PageRules + browser | HTML[] | 否 |
-| 5 | Extractor | HTML[] + ExtractionGoal | dict[str, list] | 首页是 |
+| 4 | IteratePages | PageRules + browser + Extractor | dict[str, list] | 首页是 |
+| 5 | Extract | ExtractionGoal (或已有数据) | dict[str, list] | 自由模式是 |
 | 6 | Formatter | raw_data + goal | ScrapedResult | 否 |
+
+> 步骤 4（IteratePages）采用流式架构：PageIterator 以 `AsyncGenerator` 逐页 yield HTML，IteratePagesTool 内联调用 Extractor 完成提取后丢弃 HTML，不再缓存中间页面。步骤 5（Extract）在有样本模式下仅确认数据已就绪，自由模式（无样本）时走 browser-use Agent 路径。
 
 ### 2.2 模块详解
 
@@ -81,15 +94,16 @@
 
 #### PageIterator (`browser/page_iterator.py`)
 
-纯代码执行遍历，零 AI 调用。
+纯代码执行遍历，零 AI 调用。**流式 AsyncGenerator 架构**，逐页 yield HTML。
 
 - **输入**：PageRules + browser
-- **输出**：所有页面的 HTML 列表
+- **输出**：`AsyncGenerator[str, None]` — 逐页 yield HTML（不缓存）
 - **支持的遍历模式**：
   - `load_more`：循环点击"加载更多"按钮
   - `sub_pages`：递归进入子页面（最大深度 5）
   - `pagination`：URL 模式翻页（`page/{n}`）
   - `next_button`：点击"下一页"按钮
+- **内存优化**：HTML 在被 IteratePagesTool 提取后立即离开作用域被 GC，内存中始终只保留 1 页 HTML
 
 #### Extractor (`extraction/extractor.py`)
 
@@ -180,10 +194,14 @@ browser_use/
 │   │   │   ├── __init__.py        # re-export 所有模型
 │   │   │   ├── models.py          # Pydantic 数据模型
 │   │   │   └── llm.py             # 共享 LLM 客户端工厂
-│   │   ├── pipeline/              # 编排层：任务解析 + 流水线调度
+│   │   ├── pipeline/              # 编排层：ReAct 循环 + 工具注册 + 评估重试
 │   │   │   ├── __init__.py
-│   │   │   ├── orchestrator.py    # AgentScraper 主类（6 步 Pipeline）
-│   │   │   └── task_parser.py     # LLM 指令解析
+│   │   │   ├── orchestrator.py    # AgentScraper 主类（组装 Tools + Reasoner）
+│   │   │   ├── task_parser.py     # LLM 指令解析
+│   │   │   ├── context.py         # ReAct 循环共享上下文（AgentContext）
+│   │   │   ├── tools.py           # Tool 协议 + 6 个 Tool 实现
+│   │   │   ├── reasoner.py        # ReAct 推理循环（计划→执行→评估→重试）
+│   │   │   └── evaluator.py       # 提取结果评估器
 │   │   ├── browser/               # 浏览器层：导航 + 页面遍历
 │   │   │   ├── __init__.py
 │   │   │   ├── navigator.py       # Agent 导航 + 值捕获 + 图片参考

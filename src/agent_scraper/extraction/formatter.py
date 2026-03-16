@@ -120,9 +120,40 @@ class Formatter:
 
     @staticmethod
     def _align_fields(raw_data: dict[str, list]) -> dict[str, list]:
-        """对齐各字段长度（截取到最短字段的长度）"""
+        """智能对齐各字段：优先按内容匹配配对，退化为索引截断。
+
+        典型场景：file_name=["a.txt","b.csv"] download_url=[".../b.csv",".../a.txt"]
+        按索引 zip 会错位，但按内容匹配（a.txt 出现在 .../a.txt 中）可以正确配对。
+        """
         if not raw_data:
             return {}
+
+        fields = list(raw_data.keys())
+        if len(fields) < 2:
+            return raw_data
+
+        # 尝试找到一对可以通过「文本包含」关系配对的字段
+        # 常见：file_name 的值是 download_url 值的子串
+        for i, f1 in enumerate(fields):
+            for f2 in fields[i + 1:]:
+                vals1 = raw_data[f1]
+                vals2 = raw_data[f2]
+                # 尝试 f1 值 ⊂ f2 值（或反向）
+                matched = _match_by_containment(vals1, vals2)
+                if matched is not None:
+                    aligned1, aligned2 = matched
+                    result = dict(raw_data)
+                    result[f1] = aligned1
+                    result[f2] = aligned2
+                    # 其他字段截断到配对长度
+                    n = len(aligned1)
+                    for f in fields:
+                        if f not in (f1, f2):
+                            result[f] = raw_data[f][:n]
+                    logger.info("智能对齐: %s ↔ %s (%d 对)", f1, f2, n)
+                    return result
+
+        # 退化：按最短字段截断
         min_len = min(len(v) for v in raw_data.values())
         return {k: v[:min_len] for k, v in raw_data.items()}
 
@@ -146,14 +177,21 @@ class Formatter:
 
     @staticmethod
     def _resolve_urls(records: list[dict], base_url: str) -> list[dict]:
-        """将相对 URL 补全为绝对 URL"""
-        url_fields = ["url", "href", "link", "download_url"]
+        """将相对 URL 补全为绝对 URL（动态检测 URL 字段，不依赖硬编码列表）"""
+        _URL_KEYWORDS = {"url", "href", "link", "src", "链接", "地址"}
         for record in records:
-            for field in url_fields:
-                if field in record and record[field]:
-                    val = record[field]
-                    if val.startswith("/") or (not val.startswith("http")):
-                        record[field] = urljoin(base_url, val)
+            for field, val in record.items():
+                if not val or not isinstance(val, str):
+                    continue
+                # 已经是绝对 URL 则跳过
+                if val.startswith("http://") or val.startswith("https://"):
+                    continue
+                # 判断是否需要补全：字段名含 URL 关键词，或值像相对路径
+                field_lower = field.lower()
+                is_url_field = any(kw in field_lower for kw in _URL_KEYWORDS)
+                is_relative_path = val.startswith("/")
+                if is_url_field or is_relative_path:
+                    record[field] = urljoin(base_url, val)
         return records
 
     @staticmethod
@@ -169,3 +207,43 @@ class Formatter:
         writer.writeheader()
         writer.writerows(result.data)
         return output.getvalue()
+
+
+def _match_by_containment(
+    vals1: list[str], vals2: list[str],
+) -> tuple[list[str], list[str]] | None:
+    """尝试通过「文本包含」关系配对两个字段列表。
+
+    如果 vals1 中大部分值都能在某个 vals2 值中找到（或反向），
+    返回配对后的 (aligned_vals1, aligned_vals2)。
+
+    例: vals1=["a.txt","b.csv"], vals2=[".../b.csv",".../a.txt"]
+    → (["a.txt","b.csv"], [".../a.txt",".../b.csv"])
+    """
+    # 尝试两个方向：vals1 ⊂ vals2 和 vals2 ⊂ vals1
+    for short, long, reversed_order in [(vals1, vals2, False), (vals2, vals1, True)]:
+        pairs = []
+        used = set()
+        for sv in short:
+            sv_s = str(sv).strip()
+            if not sv_s:
+                continue
+            for j, lv in enumerate(long):
+                if j in used:
+                    continue
+                if sv_s in str(lv):
+                    pairs.append((sv, lv))
+                    used.add(j)
+                    break
+
+        # 至少 60% 的短列表能配对上才算成功
+        if len(pairs) >= max(2, len(short) * 0.6):
+            if reversed_order:
+                aligned_long = [p[0] for p in pairs]
+                aligned_short = [p[1] for p in pairs]
+            else:
+                aligned_short = [p[0] for p in pairs]
+                aligned_long = [p[1] for p in pairs]
+            return (aligned_short, aligned_long)
+
+    return None

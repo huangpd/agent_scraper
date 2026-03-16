@@ -35,6 +35,8 @@ Agent Scraper 是一个 **AI 驱动的通用网页数据提取工具**。用户�
 
 当前方案：AI 只在第一页分析一次规则，后续所有页面由代码机械执行，做到 **零 LLM 调用**。
 
+PageIterator 采用 **流式 AsyncGenerator 架构**：逐页 yield HTML → IteratePagesTool 内联调用 Extractor 提取 → 丢弃 HTML → yield 下一页。内存中始终只保留 1 页 HTML，1000 页场景下内存占用从 ~200MB 降至 ~200KB。
+
 ### 3.3 三级提取降级策略
 
 ```
@@ -58,7 +60,7 @@ Agent Scraper 是一个 **AI 驱动的通用网页数据提取工具**。用户�
 - **core/**（基础层）：数据模型 + 共享 LLM 客户端工厂，不依赖其他子包
 - **browser/**（浏览器层）：导航 + 页面遍历，仅依赖 core
 - **extraction/**（提取层）：规则发现 + 数据提取 + 格式化，仅依赖 core
-- **pipeline/**（编排层）：任务解析 + 流水线调度，依赖所有子包
+- **pipeline/**（编排层）：ReAct 循环 + Tool 注册 + 评估重试，依赖所有子包
 - **autoscraper/**（独立包）：ML 提取引擎，作为独立顶层包存在
 
 LLM 客户端统一由 `core/llm.py` 工厂创建，避免各模块重复配置。
@@ -75,3 +77,4 @@ Navigator 支持传入 base64 编码的参考截图。用户可在 Web UI 上传
 - **浏览器环境**：需要 Playwright 安装 Chromium
 - **LLM 依赖**：需要可用的 OpenAI 兼容 API
 - **内存限制**：HTML 片段截取有上限（`MAX_HTML_SIZE`），防止超出 LLM 上下文窗口
+- **流式处理**：PageIterator 以 AsyncGenerator 逐页 yield HTML，提取后立即丢弃，内存中始终只保留 1 页 HTML + 累积的结构化数据，避免大量页面 HTML 堆积

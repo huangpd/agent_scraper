@@ -50,3 +50,14 @@ class TaskManager:
             info.status = TaskStatus.CANCELLED
             return True
         return False
+
+    def cancel_all(self) -> int:
+        """取消所有运行中的任务并清空任务列表，返回取消的任务数。"""
+        cancelled = 0
+        for info in self.tasks.values():
+            if info._task and not info._task.done():
+                info._task.cancel()
+                info.status = TaskStatus.CANCELLED
+                cancelled += 1
+        self.tasks.clear()
+        return cancelled

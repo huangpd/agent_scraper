@@ -2,7 +2,9 @@ import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react
 
 interface Props {
   onSend: (text: string, images?: string[]) => void
+  onStop: () => void
   disabled: boolean
+  running: boolean
   headless: boolean
   onHeadlessChange: (v: boolean) => void
 }
@@ -48,7 +50,7 @@ function readFileAsDataURL(file: File): Promise<string> {
   })
 }
 
-export function InputBar({ onSend, disabled, headless, onHeadlessChange }: Props) {
+export function InputBar({ onSend, onStop, disabled, running, headless, onHeadlessChange }: Props) {
   const [text, setText] = useState('')
   const [mode, setMode] = useState<Mode>('extract')
   const [hasEdited, setHasEdited] = useState(false)
@@ -205,9 +207,15 @@ export function InputBar({ onSend, disabled, headless, onHeadlessChange }: Props
           style={textareaHeight ? { height: textareaHeight, resize: 'none' } : undefined}
         />
         <div className="input-actions">
-          <button className="send-btn" onClick={handleSend} disabled={disabled || !text.trim()}>
-            发送
-          </button>
+          {running ? (
+            <button className="stop-btn" onClick={onStop}>
+              停止
+            </button>
+          ) : (
+            <button className="send-btn" onClick={handleSend} disabled={disabled || !text.trim()}>
+              发送
+            </button>
+          )}
           <button
             className="upload-btn"
             onClick={() => fileInputRef.current?.click()}

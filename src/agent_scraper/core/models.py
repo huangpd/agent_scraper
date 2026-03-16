@@ -20,6 +20,7 @@ class ExtractionGoal(BaseModel):
     # 用户指定的遍历模式，空=只提取当前页
     # 可选值: "load_more" | "pagination" | "sub_pages" | "next_button"
     traversal_hints: list[str] = []
+    max_pages: int | None = None  # 用户指定的最大页数（如"翻到第3页停止"→3）
 
 
 class PageRules(BaseModel):

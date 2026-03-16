@@ -14,6 +14,8 @@ load_dotenv()
 
 # 确保 browser-use 的日志完整输出到终端
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+# 过滤 browser-use EventBus 超时告警（大页面上 DOM 快照/截图慢属正常现象）
+logging.getLogger("bubus").setLevel(logging.ERROR)
 
 from agent_scraper import AgentScraper
 from agent_scraper.extraction.formatter import Formatter
