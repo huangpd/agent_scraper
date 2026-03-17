@@ -1,9 +1,9 @@
-"""测试 agent_scraper.autoscraper.auto_scraper — AutoScraper ML 增强"""
+"""测试 agent_scraper.rule_learner.auto_scraper — AutoScraper ML 增强"""
 
 import pytest
 from bs4 import BeautifulSoup
 
-from autoscraper.auto_scraper import AutoScraper
+from agent_scraper.rule_learner.learner import AutoScraper
 
 
 # 模拟一个文件列表页面
@@ -324,17 +324,20 @@ class TestHybridMode:
     def test_build_with_mixed_fields(self):
         """混合字段：文本 + URL"""
         scraper = AutoScraper()
-        url = 'https://huggingface.co/datasets/nvidia/Nemotron-ClimbMix/tree/main'
-        # url = 'https://www.ahnews.com.cn/df/hss/pc/lay/node_525.html'
+        # url = 'https://huggingface.co/datasets/nvidia/Nemotron-ClimbMix/tree/main'
+        url = 'https://www.ahnews.com.cn/df/hss/pc/lay/node_525.html'
         # url = 'https://github.com/trending'
-        wanted_dict = {
-            "file_name": [".gitattributes","README.md"],
-            "download_url": ["/datasets/nvidia/Nemotron-ClimbMix/blob/main/.gitattributes","/datasets/nvidia/Nemotron-ClimbMix/blob/main/README.md"],
-        }
+        # wanted_dict = {
+        #     "file_name": [".gitattributes","README.md"],
+        #     "download_url": ["/datasets/nvidia/Nemotron-ClimbMix/blob/main/.gitattributes","/datasets/nvidia/Nemotron-ClimbMix/blob/main/README.md"],
+        # }
         # wanted_dict = {
         #     "file_name": ["专人守护、一树一策 黄山多措并举保护古松树","黄山：以营商“软实力”夯实发展“硬支撑”"],
         #     "download_url": ["http://www.ahnews.com.cn/anhui/pc/con/2026-01/23/562_1662432.html","http://www.ahnews.com.cn/yaowen1/pc/con/2026-01/23/496_1661503.html"],
         # }
+        wanted_dict={
+            "olol":"下一页"
+        }
         # wanted_dict = {
         #     "file_name": ["Lightpanda: the headless browser designed for AI and automation"],
         #     "fork": ["660"],

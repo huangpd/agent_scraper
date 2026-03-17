@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent_scraper.pipeline.orchestrator import AgentScraper
+from agent_scraper.pipeline.prompt_optimizer import PromptOptimizer
 from server.task_manager import TaskManager, TaskStatus
 
 load_dotenv()
@@ -108,6 +109,23 @@ class PrintCapture(io.TextIOBase):
     @property
     def encoding(self):
         return self._original.encoding
+
+
+class OptimizeRequest(BaseModel):
+    instruction: str
+
+
+@app.post("/api/optimize")
+async def optimize_instruction(req: OptimizeRequest):
+    """PromptOptimizer: 优化用户指令后返回推理过程和标准化指令"""
+    optimizer = PromptOptimizer()
+    result = await optimizer.optimize(req.instruction)
+    return {
+        "optimized": result.optimized,
+        "reasoning": result.reasoning,
+        "changes": result.changes,
+        "skippable": result.skippable,
+    }
 
 
 class CreateTaskRequest(BaseModel):

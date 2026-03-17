@@ -1,4 +1,4 @@
-export type MessageType = 'user' | 'system' | 'result' | 'error' | 'step' | 'progress'
+export type MessageType = 'user' | 'system' | 'result' | 'error' | 'step' | 'progress' | 'anomaly'
 
 export interface ChatMessage {
   id: string
@@ -15,4 +15,11 @@ export interface WsEvent {
 
 export interface TaskResponse {
   task_id: string
+}
+
+export interface OptimizeResponse {
+  optimized: string
+  reasoning: string
+  changes: string[]
+  skippable: boolean
 }

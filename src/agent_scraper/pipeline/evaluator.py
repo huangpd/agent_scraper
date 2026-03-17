@@ -90,11 +90,15 @@ class Evaluator:
 
     @staticmethod
     def _field_check(
-        data: dict[str, list], goal: ExtractionGoal, issues: list[str],
+        data: list[dict], goal: ExtractionGoal, issues: list[str],
     ) -> bool:
         """所有目标字段是否都已提取到"""
         expected = set(goal.fields.keys())
-        got = {k for k, v in data.items() if v}
+        got: set[str] = set()
+        for record in data:
+            for k, v in record.items():
+                if v:
+                    got.add(k)
         missing = expected - got
         if missing:
             issues.append(f"缺少字段: {missing}")
@@ -105,34 +109,44 @@ class Evaluator:
 
     @staticmethod
     def _quality_score(
-        data: dict[str, list], goal: ExtractionGoal, issues: list[str],
+        data: list[dict], goal: ExtractionGoal, issues: list[str],
     ) -> float:
-        """综合评分：非空率 + 字段长度一致性 + 数据量 + 样本对比"""
+        """综合评分：非空率 + 字段完整性 + 数据量 + 样本对比"""
         if not data:
             issues.append("提取数据为空")
             return 0.0
 
         scores: list[float] = []
+        expected_fields = set(goal.fields.keys())
 
-        # 1) 非空率
-        lengths = [len(v) for v in data.values()]
-        if any(l == 0 for l in lengths):
-            issues.append("存在空字段")
+        # 汇总各字段的非空值
+        field_values: dict[str, list] = {f: [] for f in expected_fields}
+        for record in data:
+            for f in expected_fields:
+                val = record.get(f)
+                if val:
+                    field_values[f].append(val)
+
+        # 1) 非空率：是否存在整列为空的字段
+        empty_fields = [f for f in expected_fields if not field_values[f]]
+        if empty_fields:
+            issues.append(f"存在空字段: {empty_fields}")
             scores.append(0.0)
         else:
             scores.append(1.0)
 
-        # 2) 字段长度一致性（各字段记录数应该相近）
+        # 2) 字段完整性一致性（各字段非空数量是否接近）
+        lengths = [len(v) for v in field_values.values()]
         if len(lengths) > 1 and max(lengths) > 0:
             ratio = min(lengths) / max(lengths)
             if ratio < 0.5:
-                issues.append(f"字段长度不一致: {dict(zip(data.keys(), lengths))}")
+                issues.append(f"字段完整性不一致: {dict(zip(field_values.keys(), lengths))}")
             scores.append(ratio)
         else:
             scores.append(1.0)
 
         # 3) 数据量
-        total = sum(lengths)
+        total = len(data)
         if total == 0:
             scores.append(0.0)
         elif total < 3:
@@ -146,11 +160,11 @@ class Evaluator:
             sample_match = 0
             sample_total = 0
             for field_name, sample_values in goal.samples.items():
-                if field_name in data:
+                if field_name in field_values:
                     for sv in sample_values:
                         sample_total += 1
                         sv_n = _normalize_text(sv)
-                        if any(sv_n in _normalize_text(str(v)) for v in data[field_name]):
+                        if any(sv_n in _normalize_text(str(v)) for v in field_values[field_name]):
                             sample_match += 1
             if sample_total > 0:
                 match_rate = sample_match / sample_total
@@ -171,7 +185,7 @@ class Evaluator:
         prompt = REPLAN_PROMPT.format(
             fields=list(ctx.task.extraction_goal.fields.keys()),
             extracted=json.dumps(
-                {k: len(v) for k, v in ctx.extracted_data.items()}, ensure_ascii=False,
+                {"total_records": len(ctx.extracted_data)}, ensure_ascii=False,
             ),
             issues=issues,
             history=history_lines,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+﻿import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ChatMessage, WsEvent } from '../types'
 
 let msgId = 0
@@ -17,12 +17,15 @@ export function useWebSocket() {
     ws.onopen = () => setConnected(true)
     ws.onclose = () => setConnected(false)
 
+    const anomalies: ChatMessage[] = []
+
     ws.onmessage = (ev) => {
       const event: WsEvent = JSON.parse(ev.data)
       const id = String(++msgId)
       const timestamp = Date.now()
 
       switch (event.type) {
+        // ... rest of cases handled inside the switch ...
         case 'step':
           setMessages(prev => [...prev, {
             id, type: 'step', timestamp,
@@ -45,7 +48,6 @@ export function useWebSocket() {
           break
         }
         case 'progress':
-          // 就地更新最后一条 progress，不追加新气泡
           setMessages(prev => {
             const progressId = PROGRESS_ID_PREFIX + taskId
             const idx = prev.findIndex(m => m.id === progressId)
@@ -65,24 +67,31 @@ export function useWebSocket() {
         case 'result':
           setMessages(prev => [...prev, {
             id, type: 'result', timestamp,
-            content: `提取完成, 共 ${event.data.total} 条数据`,
+            content: `提取完成，共 ${event.data.total} 条数据`,
             data: event.data,
           }])
           break
+        case 'anomaly': {
+          const count = event.data.count as number
+          anomalies.push({
+            id, type: 'anomaly', timestamp,
+            content: (event.data.message as string) || `发现 ${count} 条可疑 URL，请检查`,
+            data: event.data,
+          })
+          break
+        }
         case 'error':
           setMessages(prev => [...prev, {
             id, type: 'error', timestamp,
             content: event.data.message as string,
-          }])
-          // 任务出错，自动断开
+          }, ...anomalies])
           ws.close()
           break
         case 'done':
           setMessages(prev => [...prev, {
             id, type: 'system', timestamp,
-            content: '✓ 任务完成',
-          }])
-          // 任务完成，自动断开
+            content: '✅ 任务完成',
+          }, ...anomalies])
           ws.close()
           break
       }

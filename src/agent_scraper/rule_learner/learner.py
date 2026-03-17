@@ -28,7 +28,7 @@ try:
 except ImportError:
     _ML_AVAILABLE = False
 
-from autoscraper.utils import (
+from .utils import (
     FuzzyText,
     ResultItem,
     get_non_rec_text,

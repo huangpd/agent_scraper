@@ -60,7 +60,7 @@ PageIterator 采用 **流式 AsyncGenerator 架构**：逐页 yield HTML → Ite
 - **core/**（基础层）：数据模型 + 共享 LLM 客户端工厂，不依赖其他子包
 - **browser/**（浏览器层）：导航 + 页面遍历，仅依赖 core
 - **extraction/**（提取层）：规则发现 + 数据提取 + 格式化，仅依赖 core
-- **pipeline/**（编排层）：ReAct 循环 + Tool 注册 + 评估重试，依赖所有子包
+- **pipeline/**（编排层）：隐式 FSM 编排 + Tool 注册 + 评估重试（演进方向：显式 FSM），依赖所有子包
 - **autoscraper/**（独立包）：ML 提取引擎，作为独立顶层包存在
 
 LLM 客户端统一由 `core/llm.py` 工厂创建，避免各模块重复配置。
@@ -70,6 +70,72 @@ LLM 客户端统一由 `core/llm.py` 工厂创建，避免各模块重复配置�
 Navigator 支持传入 base64 编码的参考截图。用户可在 Web UI 上传截图并用红框标注目标元素，系统将截图通过 `sample_images` 参数传递给多模态 LLM，帮助 Agent 精准定位页面元素。
 
 完整链路：UI (FileReader.readAsDataURL) → REST API → Navigator._convert_images() → browser_use Agent(sample_images=...)
+
+### 3.7 编排模式选型：为什么选 FSM 而非纯 ReAct
+
+#### 问题：纯 ReAct 不适合爬虫 Agent
+
+ReAct（Reasoning + Action）的核心假设是每一步都需要 LLM 推理决定下一步做什么。但爬虫任务的特点与此矛盾：
+
+| 特点 | ReAct 假设 | 爬虫现实 |
+|------|-----------|---------|
+| 决策复杂度 | 每步都需推理 | 90% 的步骤是确定性的 |
+| 分支数量 | 开放式 | 有限（capture / extract / free 三条路径） |
+| 执行体量 | 少量步骤 | 可能遍历 1000+ 页 |
+| 容错模式 | 自由探索纠错 | 错误模式有限且可枚举 |
+| 成本敏感度 | 可接受 | 每页调 LLM 不可接受 |
+
+实测验证：原生 browser-use 让 LLM Agent 负责翻页操作，5 步后仍在打转（点错元素、开新 tab、找不到"下一页"）。这是把确定性任务交给概率模型的典型失败。
+
+#### 结论：宏观 FSM 编排 + 微观节点内 Agent
+
+分层架构是最优平衡点：
+
+- **宏观层（FSM）**：显式状态机编排整体流程，状态转换是确定性的
+- **微观层（ReAct）**：在单个 FSM 节点内部保留 browser-use Agent 的自由探索
+
+```
+FSM 状态流转:
+  PARSING → ROUTING → NAVIGATING → DISCOVERING → ITERATING → EVALUATING → FORMATTING → DONE
+                         │                                        │
+                    (内部 Agent                              fail │
+                     自由探索，                                   ▼
+                     max_steps                              RETRYING
+                     硬上限)                            clear_cache → ITERATING
+                                                        retry_nav  → NAVIGATING
+                                                        skip       → FORMATTING
+```
+
+**受控自由度原则**：Navigator 内部的 browser-use Agent 可以自由探索（点按钮、等加载、重试），但它必须在 max_steps 内返回结果。FSM 外层只关心：成功了去下一个状态，失败了去 RETRYING。
+
+#### 当前实现状态
+
+当前 `Reasoner` 本质上是一个**隐式 FSM**——用 for 循环 + list + if/else 表达状态转换：
+
+```python
+# 计划是程序化生成的（不调 LLM）
+plan = _create_default_plan(task)
+# 执行是顺序线性的
+for step in plan: await tool.execute()
+# 重试策略是枚举值（不调 LLM）
+plan = _apply_retry_strategy(strategy)
+```
+
+**演进方向**：将散落的 if/else 收拢为显式转换表 `TRANSITIONS = {(State, Event) → State}`，实现：
+- 所有可能的状态转换一目了然
+- 新增状态只需加转换行，不影响现有逻辑
+- 非法转换直接报错
+- 事件回调天然对齐状态
+
+#### 各模式对比
+
+| 维度 | 纯 ReAct | 当前隐式 FSM | 显式 FSM（目标） |
+|------|---------|------------|----------------|
+| 确定性 | 低 | 中 | 高（转换表声明式） |
+| 可观测性 | 低 | 中（有 events） | 高（状态自带含义） |
+| 可扩展性 | 高（但不可控） | 中（加分支要改多处） | 高（加状态 + 转换行） |
+| LLM 开销 | 高（每步都调） | 低（3~4 次） | 低（不变） |
+| 终止保证 | 无 | 有（max_retries） | 有（状态 + 计数器） |
 
 ## 4. 非功能性约束
 

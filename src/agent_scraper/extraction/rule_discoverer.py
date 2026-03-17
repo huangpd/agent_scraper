@@ -15,7 +15,7 @@ from agent_scraper.core.models import PageRules
 logger = logging.getLogger(__name__)
 
 DISCOVER_PROMPT = """\
-你是一个网页结构分析专家。分析下面的 HTML 片段，**只**找出用户要求的遍历规则。
+你是一个网页结构分析专家。分析下面的 HTML 片段，找出遍历规则。
 
 页面当前URL: {current_url}
 用户要求的遍历模式: {requested_modes}
@@ -41,8 +41,9 @@ HTML 片段:
 CSS选择器要求:
 1. 尽量精确，能唯一定位到目标元素
 2. 用户没要求的模式，对应字段必须返回null
-3. 对于 load_more，优先用精确选择器；如果按钮没有 class/id，可以用文本匹配描述
-4. 对于 sub_pages，选择器必须**只匹配文件夹/目录链接**，不要匹配单个文件链接。
+3. 对于 load_more，优先用精确选择器；如果按钮没有 class/id，返回null（框架会自动用正则兜底匹配按钮文本）
+4. **禁止使用 :contains() 等 jQuery 伪选择器**，只能用原生 CSS 选择器（querySelector 支持的语法）
+5. 对于 sub_pages，选择器必须**只匹配文件夹/目录链接**，不要匹配单个文件链接。
    文件夹通常有文件夹图标(svg)、特殊class、或URL中包含 /tree/ 等标志。
    如果无法区分文件夹和文件，在 sub_page_url_pattern 中说明过滤规则。
 
@@ -102,11 +103,14 @@ class RuleDiscoverer:
             if "pagination" in traversal_hints:
                 filtered["pagination_url"] = data.get("pagination_url")
                 filtered["pagination_max"] = data.get("pagination_max")
+            # 详情页入口: 仅当用户显式要求 sub_pages 时才启用
             if "sub_pages" in traversal_hints:
-                filtered["sub_page_selector"] = data.get("sub_page_selector")
-                filtered["sub_page_url_attr"] = data.get("sub_page_url_attr", "href")
-                filtered["sub_page_url_filter"] = data.get("sub_page_url_filter")
-                filtered["sub_page_recursive"] = data.get("sub_page_recursive", False)
+                sub_sel = data.get("sub_page_selector")
+                if sub_sel:
+                    filtered["sub_page_selector"] = sub_sel
+                    filtered["sub_page_url_attr"] = data.get("sub_page_url_attr", "href")
+                    filtered["sub_page_url_filter"] = data.get("sub_page_url_filter")
+                    filtered["sub_page_recursive"] = data.get("sub_page_recursive", False)
 
             rules = PageRules(**{k: v for k, v in filtered.items() if v is not None})
             self._log_rules(rules)

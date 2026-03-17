@@ -3,7 +3,7 @@
 import pytest
 from lxml import html as lxml_html
 
-from autoscraper.auto_scraper import AutoScraper, _is_stable_id
+from agent_scraper.rule_learner.learner import AutoScraper, _is_stable_id
 
 
 # ─────────────────────────────────────────────────────────

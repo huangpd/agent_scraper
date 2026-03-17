@@ -1,7 +1,7 @@
-"""测试 agent_scraper.autoscraper.utils — 纯工具函数"""
+"""测试 agent_scraper.rule_learner.utils — 纯工具函数"""
 
 import pytest
-from autoscraper.utils import (
+from agent_scraper.rule_learner.utils import (
     unique_stack_list,
     unique_hashable,
     normalize,

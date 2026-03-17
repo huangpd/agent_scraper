@@ -1,7 +1,6 @@
-import type { ChatMessage } from '../types'
+﻿import type { ChatMessage } from '../types'
 import { ResultTable } from './ResultTable'
 
-/** 兜底清理 ANSI 转义序列（防御历史事件/重连缓存） */
 function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*m/g, '').replace(/\[([0-9;]*)m/g, '')
 }
@@ -26,6 +25,42 @@ export function MessageBubble({ msg }: { msg: ChatMessage }) {
     )
   }
 
+  if (msg.type === 'anomaly') {
+    const summary = (msg.data?.summary as string) || msg.content
+    const categories = (msg.data?.categories as Record<string, any>) || {}
+    const anomalyCount = (msg.data?.anomaly_count as number) || 0
+    const catOrder = ['foreign_domain', 'suspicious_page', 'abnormal_format', 'structural_outlier']
+
+    return (
+      <div className="msg-row msg-left">
+        <div className="bubble bubble-anomaly">
+          <div className="anomaly-summary">
+            {anomalyCount > 0 ? '⚠' : '✓'} {stripAnsi(summary)}
+          </div>
+          {catOrder.map(cat => {
+            const group = categories[cat]
+            if (!group) return null
+            return (
+              <div key={cat} className="anomaly-category">
+                <div className={`anomaly-cat-header cat-${cat}`}>
+                  {group.label}（{group.count}）
+                </div>
+                <ul className="anomaly-list">
+                  {(group.items as any[]).map((it: any, idx: number) => (
+                    <li key={idx}>
+                      <span className="anomaly-entry">{it.entry}</span>
+                      <span className="anomaly-reason">{it.reason}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
+
   if (msg.type === 'error') {
     return (
       <div className="msg-row msg-left">
@@ -36,7 +71,7 @@ export function MessageBubble({ msg }: { msg: ChatMessage }) {
 
   if (msg.type === 'step') {
     const status = (msg.data?.status as string) || ''
-    const icon = status === 'success' ? '✓' : status === 'failed' ? '✗' : '▸'
+    const icon = status === 'success' ? '✅' : status === 'failed' ? '❌' : '⏺'
     return (
       <div className="msg-row msg-left">
         <div className={`bubble bubble-step step-${status}`}>
@@ -62,7 +97,6 @@ export function MessageBubble({ msg }: { msg: ChatMessage }) {
     )
   }
 
-  // system / log — 按 level 和 module 分级渲染
   const level = (msg.data?.level as string) || 'info'
   const mod = (msg.data?.module as string) || ''
   const text = stripAnsi(msg.content)

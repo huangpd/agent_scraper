@@ -15,24 +15,22 @@ logger = logging.getLogger(__name__)
 class Formatter:
     async def format(
         self,
-        raw_data: dict[str, list],
+        raw_data: list[dict],
         goal: ExtractionGoal,
         source_url: str = "",
     ) -> ScrapedResult:
-        """将 AutoScraper 原始提取结果格式化为 ScrapedResult"""
+        """将行式 list[dict] 提取结果格式化为 ScrapedResult"""
         if not raw_data:
             return ScrapedResult(data=[], total_count=0, source_url=source_url)
 
-        # 对齐各字段长度
-        aligned = self._align_fields(raw_data)
+        records = list(raw_data)
 
-        # 转为 list[dict] 格式
-        field_names = list(aligned.keys())
-        count = len(next(iter(aligned.values()))) if aligned else 0
-        records = []
-        for i in range(count):
-            record = {name: aligned[name][i] for name in field_names}
-            records.append(record)
+        # 用 _source_url 元数据填充空的 URL 类字段
+        self._fill_url_from_source(records, goal.fields)
+
+        # 清除内部元数据字段
+        for rec in records:
+            rec.pop("_source_url", None)
 
         # 跨页面去重（多个页面可能提取到相同记录）
         before = len(records)
@@ -57,6 +55,28 @@ class Formatter:
             total_count=len(records),
             source_url=source_url,
         )
+
+    @staticmethod
+    def _fill_url_from_source(records: list[dict], fields: dict[str, str]):
+        """用 _source_url 元数据自动填充空的 URL 类字段。
+
+        当记录来自详情页时，_source_url 就是该详情页的地址，
+        可以直接填入名为 url/href/link 的空字段。
+        """
+        _URL_KEYWORDS = {"url", "href", "link", "链接", "地址"}
+        url_fields = [
+            f for f in fields
+            if any(kw in f.lower() for kw in _URL_KEYWORDS)
+        ]
+        if not url_fields:
+            return
+        for rec in records:
+            src = rec.get("_source_url", "")
+            if not src:
+                continue
+            for f in url_fields:
+                if not rec.get(f):
+                    rec[f] = src
 
     @staticmethod
     def _fill_missing_url_fields(

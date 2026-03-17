@@ -6,7 +6,7 @@ import json
 # 确保能找到本地 src 目录
 sys.path.insert(0, os.path.join(os.getcwd(), "src"))
 
-from autoscraper.auto_scraper import AutoScraper
+from agent_scraper.rule_learner.learner import AutoScraper
 
 # 模拟真实的 HTML 结构，带有 dataList 容器
 DATA_LIST_HTML = """

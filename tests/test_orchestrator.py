@@ -74,14 +74,17 @@ class TestAgentScraperRun:
                 return_value=PageRules(load_more_selector="button.load")
             )
 
-            # 4. PageIterator — async generator
+            # 4. PageIterator — async generator yielding (url, html) tuples
             MockPageIter.return_value.iterate = MagicMock(
-                return_value=_async_gen(["<html>page1</html>", "<html>page2</html>"])
+                return_value=_async_gen([
+                    ("https://example.com/page1", "<html>page1</html>"),
+                    ("https://example.com/page2", "<html>page2</html>"),
+                ])
             )
 
-            # 5. Extractor
+            # 5. Extractor — returns list[dict]
             MockExtractor.return_value.extract = AsyncMock(
-                return_value={"name": ["a.txt"], "url": ["/a.txt"]}
+                return_value=[{"name": "a.txt", "url": "/a.txt"}]
             )
 
             # 6. Formatter
@@ -182,9 +185,9 @@ class TestAgentScraperRun:
             MockNav.return_value.navigate = AsyncMock(return_value=mock_nav_result)
             MockRuleDisc.return_value.discover = AsyncMock(return_value=PageRules())
             MockPageIter.return_value.iterate = MagicMock(
-                return_value=_async_gen(["<html/>"])
+                return_value=_async_gen([("https://example.com", "<html/>")])
             )
-            MockExtractor.return_value.extract = AsyncMock(return_value={"name": ["x"]})
+            MockExtractor.return_value.extract = AsyncMock(return_value=[{"name": "x"}])
             mock_result = ScrapedResult(data=[{"name": "x"}], total_count=1, source_url="")
             MockFormatter.return_value.format = AsyncMock(return_value=mock_result)
             MockEvaluator.return_value.evaluate = AsyncMock(
@@ -232,12 +235,15 @@ class TestAgentScraperRun:
             MockRuleDisc.return_value.discover = AsyncMock(return_value=PageRules())
             # PageIterator.iterate 会被调用两次（初始 + clear_css_cache 重试）
             MockPageIter.return_value.iterate = MagicMock(
-                side_effect=[_async_gen(["<html/>"]), _async_gen(["<html/>"])]
+                side_effect=[
+                    _async_gen([("https://example.com", "<html/>")]),
+                    _async_gen([("https://example.com", "<html/>")]),
+                ]
             )
 
             # 第一次提取数据不完整（评估不通过），第二次完整
             MockExtractor.return_value.extract = AsyncMock(
-                side_effect=[{"name": ["partial"]}, {"name": ["ok"]}]
+                side_effect=[[{"name": "partial"}], [{"name": "ok"}]]
             )
             mock_result = ScrapedResult(data=[{"name": "ok"}], total_count=1, source_url="")
             MockFormatter.return_value.format = AsyncMock(return_value=mock_result)

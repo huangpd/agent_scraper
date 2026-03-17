@@ -7,8 +7,7 @@ import os
 
 class Repo(BaseModel):
     url: str
-    stars: str
-    forks: str
+    title: str
 
 
 class Posts(BaseModel):
@@ -29,11 +28,12 @@ async def main():
 
     agent = Agent(
         task="""
-        打开 https://github.com/trending
+        步骤1: 打开 https://www.ahnews.com.cn/df/hss/pc/lay/node_525.html
+        步骤2: 获取列表页URL和title
+        步骤3: 点击"下一页"链接，获取前3页数据
         获取当前页面的所有项目：
-        - 项目URL
-        - stars
-        - forks
+        - URL:文章链接
+        - title:文章标题
         """,
         llm=llm,
         browser=browser,

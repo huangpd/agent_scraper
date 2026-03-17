@@ -1,6 +1,7 @@
 """LLM 解析自然语言指令 → 结构化 ParsedTask"""
 
 import json
+import logging
 import re
 from collections import defaultdict
 
@@ -8,7 +9,9 @@ from openai import AsyncOpenAI
 
 from agent_scraper.core.llm import create_openai_client, get_model_name
 
-from agent_scraper.core.models import ExtractionGoal, NavigationStep, ParsedTask
+from agent_scraper.core.models import ExtractionGoal, NavigationStep, PageRules, ParsedTask
+
+logger = logging.getLogger(__name__)
 
 PARSE_PROMPT = """\
 你是一个任务解析器。将用户的自然语言爬取指令解析为结构化JSON。
@@ -59,8 +62,13 @@ max_pages: 用户指定的最大页数限制（整数），没有则为 null：
 - 没有提到页数限制 → null
 
 分析规则：
-1. navigation_steps 只包含到达目标页面的步骤（打开URL、点击标签等）
-2. "加载更多"、"翻页"、"进入文件夹"这些不算导航步骤，归入 traversal_hints
+1. navigation_steps 只包含到达目标页面的步骤（打开URL、点击标签页等一次性操作）
+2. **严格禁止**将以下操作放入 navigation_steps，它们必须归入 traversal_hints：
+   - "加载更多"/"Load more"/"点击直到消失" → traversal_hints: ["load_more"]
+   - "翻页"/"所有页" → traversal_hints: ["pagination"]
+   - "进入文件夹"/"遍历子页面" → traversal_hints: ["sub_pages"]
+   - "下一页" → traversal_hints: ["next_button"]
+   这些操作由框架的 PageIterator 循环执行，不能作为一次性导航步骤
 3. 识别提取目标字段
 4. 忽略"样本数据"/"示例"部分
 5. 默认 output_format 为 json
@@ -100,6 +108,8 @@ class TaskParser:
         # LLM 识别遍历模式 + 关键词兜底（防止 LLM 遗漏）
         hints = goal_data.get("traversal_hints", [])
         hints = self._ensure_traversal_hints(hints, instruction)
+        # 代码兜底：从 navigation_steps 中剔除遍历操作（LLM 可能误放）
+        steps = self._strip_traversal_from_nav(steps, hints)
 
         # LLM 识别模式 + 关键词兜底
         mode = data.get("mode", "extract")
@@ -109,6 +119,11 @@ class TaskParser:
         max_pages = goal_data.get("max_pages")
         max_pages = self._ensure_max_pages(max_pages, instruction)
 
+        # 从用户指令中提取 load_more 按钮文本
+        load_more_text = None
+        if "load_more" in hints:
+            load_more_text = self._extract_load_more_text(instruction)
+
         goal = ExtractionGoal(
             fields=goal_data["fields"],
             output_format=goal_data.get("output_format", "json"),
@@ -116,6 +131,7 @@ class TaskParser:
             samples=samples if samples else None,
             traversal_hints=hints,
             max_pages=max_pages,
+            load_more_text=load_more_text,
         )
 
         return ParsedTask(
@@ -124,6 +140,42 @@ class TaskParser:
             raw_instruction=instruction,
             mode=mode,
         )
+
+    # 导航步骤中属于遍历操作的关键词 → 应从 nav_steps 剔除
+    _TRAVERSAL_NAV_KEYWORDS = {
+        "load_more": ["load more", "加载更多", "全部加载", "加载全部", "加载文件"],
+        "sub_pages": ["遍历子页面", "遍历文件夹", "进入文件夹", "进入每个"],
+        "pagination": ["翻页", "所有页", "每一页"],
+        "next_button": ["下一页", "next page"],
+    }
+
+    @classmethod
+    def _strip_traversal_from_nav(
+        cls, steps: list[NavigationStep], hints: list[str],
+    ) -> list[NavigationStep]:
+        """将被 LLM 误放进 navigation_steps 的遍历操作剔除。
+
+        例: "点击 Load more files" 出现在 nav_steps 且 hints 含 load_more → 剔除
+        """
+        if not hints:
+            return steps
+
+        # 收集所有活跃遍历模式的关键词
+        active_keywords: list[str] = []
+        for hint in hints:
+            active_keywords.extend(cls._TRAVERSAL_NAV_KEYWORDS.get(hint, []))
+
+        if not active_keywords:
+            return steps
+
+        cleaned = []
+        for step in steps:
+            text = (step.target + " " + step.description).lower()
+            if any(kw in text for kw in active_keywords):
+                logger.info("[TaskParser] 从导航步骤中剔除遍历操作: '%s'", step.description or step.target)
+                continue
+            cleaned.append(step)
+        return cleaned
 
     @staticmethod
     def _ensure_traversal_hints(hints: list[str], instruction: str) -> list[str]:
@@ -172,6 +224,28 @@ class TaskParser:
             m = re.search(pattern, instruction)
             if m:
                 return int(m.group(1))
+        return None
+
+    @staticmethod
+    def _extract_load_more_text(instruction: str) -> str | None:
+        """从指令中提取用户描述的加载更多按钮文本。
+
+        匹配模式:
+        - 引号包裹: "更多>>"、'Load more files'
+        - 点击X按钮: 点击「更多」按钮
+        """
+        # 匹配各种引号包裹的文本（在 load more 相关上下文中）
+        patterns = [
+            r'["\u201c\u201d\'`\u300c\u300d]([^"\u201c\u201d\'`\u300c\u300d]{1,30})["\u201c\u201d\'`\u300c\u300d]',
+        ]
+        # 内置文本不需要提取（已在正则里）
+        builtin = {"load more", "加载更多", "show more", "load more files"}
+
+        for pattern in patterns:
+            for m in re.finditer(pattern, instruction):
+                text = m.group(1).strip()
+                if text and text.lower() not in builtin:
+                    return text
         return None
 
     @staticmethod

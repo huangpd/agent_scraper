@@ -7,8 +7,8 @@ from bs4 import BeautifulSoup
 
 from agent_scraper.core.llm import create_openai_client, get_model_name
 from agent_scraper.core.models import ExtractionGoal
-from autoscraper.auto_scraper import AutoScraper
-from autoscraper.utils import normalize
+from agent_scraper.rule_learner import AutoScraper
+from agent_scraper.rule_learner.utils import normalize
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +73,11 @@ class Extractor:
         )
         return resp.choices[0].message.content.strip()
 
-    async def extract(self, html: str, goal: ExtractionGoal) -> dict[str, list]:
-        """优先使用 AutoScraper (ML)，只有失败时才用简单的 CSS LLM 兜底"""
+    async def extract(self, html: str, goal: ExtractionGoal) -> list[dict]:
+        """优先使用 AutoScraper (ML)，只有失败时才用简单的 CSS LLM 兜底。
+
+        返回 list[dict] 行式数据，每行一条记录。
+        """
         expected_fields = set(goal.fields.keys())
 
         # 1. AutoScraper 路径 (机器学习)
@@ -88,10 +91,20 @@ class Extractor:
         if self._trained_scraper:
             as_result = self._trained_scraper.get_result_similar(html=html, group_by_alias=True)
             if any(len(v) > 0 for v in as_result.values()):
-                return as_result
+                return self._columns_to_rows(as_result)
 
         # 2. 简单 CSS 兜底
-        return await self._css_selector_extract(html, goal, expected_fields)
+        columns = await self._css_selector_extract(html, goal, expected_fields)
+        return self._columns_to_rows(columns)
+
+    @staticmethod
+    def _columns_to_rows(data: dict[str, list]) -> list[dict]:
+        """列式 dict[str, list] → 行式 list[dict]，按最短列截断对齐。"""
+        if not data:
+            return []
+        keys = list(data.keys())
+        min_len = min(len(v) for v in data.values())
+        return [{k: data[k][i] for k in keys} for i in range(min_len)]
 
     async def _css_selector_extract(self, html: str, goal: ExtractionGoal, expected_fields: set[str]) -> dict:
         # 与 AutoScraper._get_soup 保持一致的预处理链

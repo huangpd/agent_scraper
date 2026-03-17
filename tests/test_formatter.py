@@ -135,10 +135,32 @@ class TestDedupRecords:
         assert Formatter._dedup_records([]) == []
 
 
+class TestFillUrlFromSource:
+    def test_fills_empty_url_field(self):
+        records = [
+            {"title": "Page 1", "URL": "", "_source_url": "https://example.com/page1"},
+            {"title": "Page 2", "URL": "", "_source_url": "https://example.com/page2"},
+        ]
+        fields = {"title": "标题", "URL": "链接"}
+        Formatter._fill_url_from_source(records, fields)
+        assert records[0]["URL"] == "https://example.com/page1"
+        assert records[1]["URL"] == "https://example.com/page2"
+
+    def test_no_overwrite_existing(self):
+        records = [{"URL": "https://existing.com", "_source_url": "https://other.com"}]
+        Formatter._fill_url_from_source(records, {"URL": "链接"})
+        assert records[0]["URL"] == "https://existing.com"
+
+    def test_no_url_field(self):
+        records = [{"title": "Page", "_source_url": "https://example.com"}]
+        Formatter._fill_url_from_source(records, {"title": "标题"})
+        assert "URL" not in records[0]
+
+
 class TestFormat:
     @pytest.mark.asyncio
     async def test_basic_format(self, formatter):
-        raw = {"name": ["a.txt", "b.txt"], "size": ["1KB", "2KB"]}
+        raw = [{"name": "a.txt", "size": "1KB"}, {"name": "b.txt", "size": "2KB"}]
         goal = ExtractionGoal(fields={"name": "文件名", "size": "大小"})
         result = await formatter.format(raw, goal, "https://example.com")
         assert isinstance(result, ScrapedResult)
@@ -148,16 +170,27 @@ class TestFormat:
     @pytest.mark.asyncio
     async def test_empty_data(self, formatter):
         goal = ExtractionGoal(fields={"name": "文件名"})
-        result = await formatter.format({}, goal, "")
+        result = await formatter.format([], goal, "")
         assert result.total_count == 0
         assert result.data == []
 
     @pytest.mark.asyncio
     async def test_url_resolved(self, formatter):
-        raw = {"name": ["a.txt"], "url": ["/repo/a.txt"]}
+        raw = [{"name": "a.txt", "url": "/repo/a.txt"}]
         goal = ExtractionGoal(fields={"name": "名称", "url": "链接"})
         result = await formatter.format(raw, goal, "https://example.com/page")
         assert result.data[0]["url"].startswith("https://")
+
+    @pytest.mark.asyncio
+    async def test_source_url_fills_empty_url_field(self, formatter):
+        raw = [
+            {"title": "P1", "URL": "", "_source_url": "https://example.com/p1"},
+            {"title": "P2", "URL": "", "_source_url": "https://example.com/p2"},
+        ]
+        goal = ExtractionGoal(fields={"title": "标题", "URL": "链接"})
+        result = await formatter.format(raw, goal, "https://example.com")
+        assert result.data[0]["URL"] == "https://example.com/p1"
+        assert "_source_url" not in result.data[0]  # 元数据已清除
 
 
 class TestOutputFormats:

@@ -34,7 +34,7 @@ class AgentContext:
     browser: Any = None
     html: str = ""
     page_rules: PageRules | None = None
-    extracted_data: dict[str, list] = field(default_factory=dict)
+    extracted_data: list[dict] = field(default_factory=list)
     result: ScrapedResult | None = None
     source_url: str = ""
 
@@ -45,3 +45,6 @@ class AgentContext:
     steps: list[StepRecord] = field(default_factory=list)
     retry_count: int = 0
     max_retries: int = 3
+    skip_discover: bool = False
+    skip_iterate: bool = False
+    had_samples_initially: bool = False  # 区分缓存注入 vs 用户提供样本

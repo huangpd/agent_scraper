@@ -227,17 +227,25 @@ class IteratePagesTool(Tool):
     def __init__(self, extractor=None):
         self._extractor = extractor
 
+    # 字段名包含这些关键词视为 URL 字段
+    _URL_KEYWORDS = frozenset({"url", "href", "link", "链接", "地址"})
+
     async def execute(self, ctx: AgentContext, **params) -> ToolResult:
         from agent_scraper.browser.page_iterator import PageIterator
         from agent_scraper.core.models import PageRules
 
         has_samples = bool(ctx.task.extraction_goal.samples)
+        # 预计算目标中的 URL 类字段名
+        url_fields = [
+            f for f in ctx.task.extraction_goal.fields
+            if any(kw in f.lower() for kw in self._URL_KEYWORDS)
+        ]
 
         if not ctx.browser:
             # 无浏览器兜底：直接对 ctx.html 提取，不缓存
             if self._extractor and has_samples and ctx.html:
-                page_data = await self._extractor.extract(ctx.html, ctx.task.extraction_goal)
-                ctx.extracted_data = page_data
+                records = await self._extractor.extract(ctx.html, ctx.task.extraction_goal)
+                ctx.extracted_data = records
             return ToolResult(
                 success=bool(ctx.html),
                 data={"page_count": 1 if ctx.html else 0},
@@ -249,24 +257,61 @@ class IteratePagesTool(Tool):
         user_max = ctx.task.extraction_goal.max_pages
         if user_max:
             rules = rules.model_copy(update={"pagination_max": user_max})
+
+        load_more_hint = "load_more" in (ctx.task.extraction_goal.traversal_hints or [])
+        load_more_text = ctx.task.extraction_goal.load_more_text
+
+        # ── 自由模式（无样本）: 只做 load_more 扩展页面，不遍历子页面 ──
+        # browser-use Agent 只能在当前浏览器页面提取，遍历会导致浏览器离开当前页
+        if not has_samples:
+            try:
+                if load_more_hint or rules.load_more_selector:
+                    iterator = PageIterator(ctx.browser)
+                    await iterator._try_load_more(
+                        rules.load_more_selector, custom_text=load_more_text,
+                    )
+                    ctx.html = await iterator._get_html()
+                    logger.info("  自由模式: load_more 完成，页面 %.0fKB", len(ctx.html) / 1024)
+                return ToolResult(
+                    success=True,
+                    data={"page_count": 1},
+                    summary="自由模式: load_more 完成，等待 Agent 提取",
+                )
+            except Exception as e:
+                return ToolResult(
+                    success=bool(ctx.html),
+                    error=str(e),
+                    summary=f"自由模式 load_more 异常: {e}",
+                )
+
+        # ── 样本模式: 遍历 + 逐页提取 ──
         try:
             iterator = PageIterator(ctx.browser)
-            all_data: dict[str, list] = {}
+            all_records: list[dict] = []
             page_count = 0
 
-            async for html in iterator.iterate(ctx.html, rules, ctx.source_url):
+            async for page_url, html in iterator.iterate(
+                ctx.html, rules, ctx.source_url,
+                load_more_hint=load_more_hint,
+                load_more_text=load_more_text,
+            ):
                 page_count += 1
                 logger.info("  提取页面 [%d] (%.0fKB)...", page_count, len(html) / 1024)
                 ctx.on_event("progress", {"current": page_count, "total": 0})
 
-                if self._extractor and has_samples:
-                    page_data = await self._extractor.extract(html, ctx.task.extraction_goal)
-                    for key, values in page_data.items():
-                        all_data.setdefault(key, []).extend(values)
+                if self._extractor:
+                    page_records = await self._extractor.extract(html, ctx.task.extraction_goal)
+                    for rec in page_records:
+                        rec["_source_url"] = page_url
+                        # 立即填充空的 URL 字段（Evaluator 在 Formatter 之前，不能等）
+                        for f in url_fields:
+                            if not rec.get(f):
+                                rec[f] = page_url
+                    all_records.extend(page_records)
                 # html 离开作用域后被 GC
 
-            if all_data:
-                ctx.extracted_data = all_data
+            if all_records:
+                ctx.extracted_data = all_records
 
             return ToolResult(
                 success=True,
@@ -275,9 +320,9 @@ class IteratePagesTool(Tool):
             )
         except Exception as e:
             # 遍历失败降级为单页提取
-            if self._extractor and has_samples and ctx.html:
-                page_data = await self._extractor.extract(ctx.html, ctx.task.extraction_goal)
-                ctx.extracted_data = page_data
+            if self._extractor and ctx.html:
+                records = await self._extractor.extract(ctx.html, ctx.task.extraction_goal)
+                ctx.extracted_data = records
             return ToolResult(
                 success=bool(ctx.html),
                 error=str(e),
@@ -313,26 +358,24 @@ class ExtractTool(Tool):
 
         # 有样本: IteratePagesTool 已经完成了流式提取
         if ctx.extracted_data:
-            field_counts = {k: len(v) for k, v in ctx.extracted_data.items()}
-            total = sum(field_counts.values())
+            total = len(ctx.extracted_data)
             return ToolResult(
                 success=total > 0,
-                data=field_counts,
-                summary=f"提取: {field_counts}" if total > 0 else "提取到 0 条数据",
+                data={"total": total},
+                summary=f"提取: {total} 条记录" if total > 0 else "提取到 0 条数据",
                 error="提取到 0 条数据" if total == 0 else None,
             )
 
         # 兜底: 有样本但无数据 + 有 HTML → 单页提取
         if ctx.html:
             try:
-                page_data = await self._extractor.extract(ctx.html, ctx.task.extraction_goal)
-                ctx.extracted_data = page_data
-                field_counts = {k: len(v) for k, v in page_data.items()}
-                total = sum(field_counts.values())
+                records = await self._extractor.extract(ctx.html, ctx.task.extraction_goal)
+                ctx.extracted_data = records
+                total = len(records)
                 return ToolResult(
                     success=total > 0,
-                    data=field_counts,
-                    summary=f"提取: {field_counts}" if total > 0 else "提取到 0 条数据",
+                    data={"total": total},
+                    summary=f"提取: {total} 条记录" if total > 0 else "提取到 0 条数据",
                     error="提取到 0 条数据" if total == 0 else None,
                 )
             except Exception as e:
@@ -363,7 +406,6 @@ class ExtractTool(Tool):
         task_text = (
             f"从当前页面提取以下所有数据行:\n{fields_desc}\n\n"
             f"提取页面上所有匹配的数据行，每行包含上述所有字段。\n"
-            f"不要导航到其他页面，仅从当前页面提取。"
         )
 
         logger.info("[ExtractTool] 自由模式: browser-use Agent + output_model_schema")
@@ -406,22 +448,20 @@ class ExtractTool(Tool):
                     summary="自由模式: 0 条数据",
                 )
 
-            # 5. 转换为 {field: [values]} 格式（空值用 "" 占位，保持各字段长度对齐）
-            all_data: dict[str, list] = {f: [] for f in fields}
+            # 5. 规范化为 list[dict]，每行只保留目标字段
+            normalized = []
             for record in records:
-                for field_name in fields:
-                    val = record.get(field_name, "")
-                    all_data[field_name].append(str(val) if val else "")
+                row = {f: str(record.get(f, "")) for f in fields}
+                normalized.append(row)
 
-            ctx.extracted_data = all_data
-            field_counts = {k: len(v) for k, v in all_data.items()}
-            total = sum(field_counts.values())
-            logger.info("[ExtractTool] 自由模式提取完成: %s", field_counts)
+            ctx.extracted_data = normalized
+            total = len(normalized)
+            logger.info("[ExtractTool] 自由模式提取完成: %d 条记录", total)
 
             return ToolResult(
                 success=total > 0,
-                data=field_counts,
-                summary=f"自由模式提取: {field_counts}",
+                data={"total": total},
+                summary=f"自由模式提取: {total} 条记录",
                 error=None if total > 0 else "提取到 0 条数据",
             )
         except Exception as e:

@@ -38,13 +38,13 @@ class TestIteratePagesTool:
     @patch("agent_scraper.browser.page_iterator.PageIterator")
     async def test_stream_extract_no_html_accumulation(self, MockPageIter):
         """验证页面 HTML 不会累积，extracted_data 有数据"""
-        pages = [f"<html>page{i}</html>" for i in range(5)]
+        pages = [(f"https://example.com/page{i}", f"<html>page{i}</html>") for i in range(5)]
         MockPageIter.return_value.iterate = MagicMock(return_value=_async_gen(pages))
 
         extractor = MagicMock()
         extractor.extract = AsyncMock(
             side_effect=[
-                {"name": [f"file{i}.txt"], "url": [f"/file{i}"]}
+                [{"name": f"file{i}.txt", "url": f"/file{i}"}]
                 for i in range(5)
             ]
         )
@@ -58,14 +58,39 @@ class TestIteratePagesTool:
         assert result.success
         assert result.data["page_count"] == 5
         assert not hasattr(ctx, "html_pages")
-        assert len(ctx.extracted_data["name"]) == 5
-        assert len(ctx.extracted_data["url"]) == 5
+        assert len(ctx.extracted_data) == 5
+        assert all("_source_url" in r for r in ctx.extracted_data)
+        # url 字段已有值时不被覆盖
+        assert ctx.extracted_data[0]["url"] == "/file0"
+
+    @pytest.mark.asyncio
+    @patch("agent_scraper.browser.page_iterator.PageIterator")
+    async def test_empty_url_filled_from_source(self, MockPageIter):
+        """url 字段为空时，用详情页地址自动填充"""
+        pages = [("https://example.com/detail/1", "<html>d1</html>")]
+        MockPageIter.return_value.iterate = MagicMock(return_value=_async_gen(pages))
+
+        extractor = MagicMock()
+        # AutoScraper 提取到 name 但 url 为空
+        extractor.extract = AsyncMock(return_value=[{"name": "title1", "url": ""}])
+
+        browser = MagicMock()
+        ctx = _make_ctx(browser=browser)
+
+        tool = IteratePagesTool(extractor=extractor)
+        result = await tool.execute(ctx)
+
+        assert result.success
+        assert len(ctx.extracted_data) == 1
+        # 空 url 被 _source_url 填充
+        assert ctx.extracted_data[0]["url"] == "https://example.com/detail/1"
+        assert ctx.extracted_data[0]["_source_url"] == "https://example.com/detail/1"
 
     @pytest.mark.asyncio
     async def test_single_page_no_browser(self):
         """无浏览器时降级为单页提取"""
         extractor = MagicMock()
-        extractor.extract = AsyncMock(return_value={"name": ["x"], "url": ["/x"]})
+        extractor.extract = AsyncMock(return_value=[{"name": "x", "url": "/x"}])
 
         ctx = _make_ctx(html="<html>single</html>")
         tool = IteratePagesTool(extractor=extractor)
@@ -74,17 +99,17 @@ class TestIteratePagesTool:
         assert result.success
         assert result.data["page_count"] == 1
         extractor.extract.assert_called_once()
-        assert ctx.extracted_data == {"name": ["x"], "url": ["/x"]}
+        assert ctx.extracted_data == [{"name": "x", "url": "/x"}]
 
     @pytest.mark.asyncio
     @patch("agent_scraper.browser.page_iterator.PageIterator")
     async def test_extractor_called_per_page(self, MockPageIter):
         """Extractor 对每页调用一次"""
-        pages = ["<html>p1</html>", "<html>p2</html>", "<html>p3</html>"]
+        pages = [("https://example.com/p1", "<html>p1</html>"), ("https://example.com/p2", "<html>p2</html>"), ("https://example.com/p3", "<html>p3</html>")]
         MockPageIter.return_value.iterate = MagicMock(return_value=_async_gen(pages))
 
         extractor = MagicMock()
-        extractor.extract = AsyncMock(return_value={"name": ["x"], "url": ["/x"]})
+        extractor.extract = AsyncMock(return_value=[{"name": "x", "url": "/x"}])
 
         browser = MagicMock()
         ctx = _make_ctx(browser=browser)
@@ -98,11 +123,11 @@ class TestIteratePagesTool:
     @patch("agent_scraper.browser.page_iterator.PageIterator")
     async def test_progress_events_emitted(self, MockPageIter):
         """每页发出 progress 事件"""
-        pages = ["<html>p1</html>", "<html>p2</html>"]
+        pages = [("https://example.com/p1", "<html>p1</html>"), ("https://example.com/p2", "<html>p2</html>")]
         MockPageIter.return_value.iterate = MagicMock(return_value=_async_gen(pages))
 
         extractor = MagicMock()
-        extractor.extract = AsyncMock(return_value={"name": ["x"], "url": ["/x"]})
+        extractor.extract = AsyncMock(return_value=[{"name": "x", "url": "/x"}])
 
         events = []
         browser = MagicMock()
@@ -121,7 +146,7 @@ class TestIteratePagesTool:
     @patch("agent_scraper.browser.page_iterator.PageIterator")
     async def test_no_extractor_skips_extraction(self, MockPageIter):
         """没传 Extractor 时只遍历不提取"""
-        pages = ["<html>p1</html>", "<html>p2</html>"]
+        pages = [("https://example.com/p1", "<html>p1</html>"), ("https://example.com/p2", "<html>p2</html>")]
         MockPageIter.return_value.iterate = MagicMock(return_value=_async_gen(pages))
 
         browser = MagicMock()
@@ -132,17 +157,17 @@ class TestIteratePagesTool:
 
         assert result.success
         assert result.data["page_count"] == 2
-        assert ctx.extracted_data == {}  # 无提取
+        assert ctx.extracted_data == []  # 无提取
 
     @pytest.mark.asyncio
     @patch("agent_scraper.browser.page_iterator.PageIterator")
     async def test_free_mode_skips_inline_extract(self, MockPageIter):
         """无样本（自由模式）时 IteratePagesTool 不做内联提取"""
-        pages = ["<html>p1</html>"]
+        pages = [("https://example.com/p1", "<html>p1</html>")]
         MockPageIter.return_value.iterate = MagicMock(return_value=_async_gen(pages))
 
         extractor = MagicMock()
-        extractor.extract = AsyncMock(return_value={"name": ["x"]})
+        extractor.extract = AsyncMock(return_value=[{"name": "x"}])
 
         browser = MagicMock()
         # 构造无样本的 ctx
@@ -164,4 +189,4 @@ class TestIteratePagesTool:
         assert result.success
         # 无样本时不调用 extractor
         extractor.extract.assert_not_called()
-        assert ctx.extracted_data == {}
+        assert ctx.extracted_data == []

@@ -16,6 +16,7 @@ from agent_scraper.extraction.rule_discoverer import RuleDiscoverer
 from agent_scraper.pipeline.context import AgentContext
 from agent_scraper.pipeline.evaluator import Evaluator
 from agent_scraper.pipeline.reasoner import Reasoner
+from agent_scraper.pipeline.rule_cache import RuleCache
 from agent_scraper.pipeline.task_parser import TaskParser
 from agent_scraper.pipeline.tools import (
     CaptureNavigateTool,
@@ -58,12 +59,14 @@ class AgentScraper:
         self.registry.register(ExtractTool(extractor))
         self.registry.register(FormatTool(formatter))
 
-        # ── 3. 评估器 + 推理器 ──
+        # ── 3. 评估器 + 规则缓存 + 推理器 ──
         evaluator = Evaluator(client=client, model=model)
+        self.rule_cache = RuleCache()
         self.reasoner = Reasoner(
             tools=self.registry,
             evaluator=evaluator,
             on_event=self.on_event,
+            rule_cache=self.rule_cache,
         )
 
     async def run(
