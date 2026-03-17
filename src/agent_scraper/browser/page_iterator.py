@@ -87,54 +87,75 @@ class PageIterator:
         """尝试点击 Load more 按钮。有选择器用选择器，没有用通用文本匹配"""
         click_count = 0
         prev_height = 0
+        prev_count = 0
+        
         while click_count < max_clicks:
+            # 监测 DOM 数量和高度
+            metrics = await self._eval("() => ({ height: document.body.scrollHeight, count: document.querySelectorAll('*').length })")
+            cur_height = metrics.get("height", 0)
+            cur_count = metrics.get("count", 0)
+            
+            # 如果连续两次指标都没变（且不是第一次），说明可能加载到底了
+            if click_count > 0 and cur_height == prev_height and cur_count == prev_count:
+                logger.info("内容不再增加，停止 load_more")
+                break
+                
+            prev_height = cur_height
+            prev_count = cur_count
+
             js = self._build_load_more_js(selector)
             result = await self._eval(js)
             if result != "clicked":
+                # 再次尝试：有时按钮是异步出现的，或者文本匹配需要更宽泛
                 break
+                
             click_count += 1
             if click_count % 5 == 0:
-                logger.info("load_more 已点击 %d 次...", click_count)
-            await asyncio.sleep(1.5)
-            # 检测页面是否有变化（防止按钮始终可见的死循环）
-            cur_height = await self._eval("() => document.body.scrollHeight")
-            if cur_height == prev_height:
-                logger.info("load_more 页面无变化，停止")
-                break
-            prev_height = cur_height
+                logger.info("已点击 %d 次 Load more...", click_count)
+            
+            # 等待加载（增加一点随机性或确保网络空闲更好，这里先用简单 sleep）
+            await asyncio.sleep(2)
+            
         if click_count >= max_clicks:
-            logger.warning("load_more 达到上限 %d 次，停止", max_clicks)
+            logger.warning("已达到 Load more 上限 %d 次", max_clicks)
         elif click_count > 0:
-            logger.info("load_more 完成，共点击 %d 次", click_count)
+            logger.info("Load more 完成，共点击 %d 次", click_count)
 
     @staticmethod
     def _build_load_more_js(selector: str | None) -> str:
         """构建 Load more 点击的 JS"""
+        # 更加通用的文本匹配正则
+        text_regex = "/load more|加载更多|查看更多|更多内容|显示更多|show more|more files/i"
+        
         if selector:
             safe_sel = selector.replace("'", "\\'")
             return (
                 f"() => {{"
                 f"  let btn = document.querySelector('{safe_sel}');"
                 f"  if (!btn || btn.offsetParent === null) {{"
-                f"    const all = [...document.querySelectorAll('button, a')];"
-                f"    btn = all.find(e => /load more|加载更多|show more/i.test(e.textContent.trim()));"
+                f"    const all = [...document.querySelectorAll('button, a, span[role=\"button\"]')];"
+                f"    btn = all.find(e => {text_regex}.test(e.textContent.trim()));"
                 f"  }}"
                 f"  if (btn && btn.offsetParent !== null) {{"
-                f"    btn.scrollIntoView(); btn.click(); return 'clicked';"
+                f"    btn.scrollIntoView({{ behavior: 'smooth', block: 'center' }}); "
+                f"    setTimeout(() => btn.click(), 100); "
+                f"    return 'clicked';"
                 f"  }}"
                 f"  return 'not_found';"
                 f"}}"
             )
         else:
             return (
-                "() => {"
-                "  const all = [...document.querySelectorAll('button, a')];"
-                "  const btn = all.find(e => /load more|加载更多|show more|load more files/i.test(e.textContent.trim()));"
-                "  if (btn && btn.offsetParent !== null) {"
-                "    btn.scrollIntoView(); btn.click(); return 'clicked';"
-                "  }"
-                "  return 'not_found';"
-                "}"
+                f"() => {{"
+                f"  const all = [...document.querySelectorAll('button, a, span[role=\"button\"]')];"
+                f"  const btn = all.find(e => {text_regex}.test(e.textContent.trim()));"
+                f"  if (btn && btn.offsetParent !== null) {{"
+                f"    btn.scrollIntoView({{ behavior: 'smooth', block: 'center' }}); "
+                f"    setTimeout(() => btn.click(), 100); "
+                f"    return 'clicked';"
+                f"  }}"
+                f"  return 'not_found';"
+                f"}}"
             )
 
     # ── sub_pages (真正递归) ─────────────────────────────

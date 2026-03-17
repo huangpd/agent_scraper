@@ -93,20 +93,17 @@ class RuleDiscoverer:
 
             data = json.loads(content)
 
-            # 只保留用户要求的模式
-            filtered = {}
-            if "load_more" in traversal_hints:
-                filtered["load_more_selector"] = data.get("load_more_selector")
-            if "next_button" in traversal_hints:
-                filtered["next_button_selector"] = data.get("next_button_selector")
-            if "pagination" in traversal_hints:
-                filtered["pagination_url"] = data.get("pagination_url")
-                filtered["pagination_max"] = data.get("pagination_max")
-            if "sub_pages" in traversal_hints:
-                filtered["sub_page_selector"] = data.get("sub_page_selector")
-                filtered["sub_page_url_attr"] = data.get("sub_page_url_attr", "href")
-                filtered["sub_page_url_filter"] = data.get("sub_page_url_filter")
-                filtered["sub_page_recursive"] = data.get("sub_page_recursive", False)
+            # 采纳 LLM 发现的所有规则，不再根据 hints 强制过滤（hints 仅作为 prompt 引导）
+            filtered = {
+                "load_more_selector": data.get("load_more_selector"),
+                "next_button_selector": data.get("next_button_selector"),
+                "pagination_url": data.get("pagination_url"),
+                "pagination_max": data.get("pagination_max"),
+                "sub_page_selector": data.get("sub_page_selector"),
+                "sub_page_url_attr": data.get("sub_page_url_attr", "href"),
+                "sub_page_url_filter": data.get("sub_page_url_filter"),
+                "sub_page_recursive": data.get("sub_page_recursive", False)
+            }
 
             rules = PageRules(**{k: v for k, v in filtered.items() if v is not None})
             self._log_rules(rules)
