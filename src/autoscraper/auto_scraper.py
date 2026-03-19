@@ -61,7 +61,54 @@ def _is_hashed_class(cls: str) -> bool:
 def _stable_classes(classes) -> list:
     if not classes: return []
     if isinstance(classes, str): classes = classes.split()
-    return [c for c in classes if not _is_hashed_class(c)]
+    return [c for c in classes if not _is_hashed_class(c) and not _is_tailwind_class(c)]
+
+# ─────────────────────────────────────────────────────────
+# Tailwind CSS 原子 class 检测
+# ─────────────────────────────────────────────────────────
+# 这些单词即使是 Tailwind 内置类也保留，因为它们有足够的语义锚定价值
+_TAILWIND_BARE_EXCEPTIONS = frozenset({
+    "container", "group", "peer", "contents", "border",
+    "prose", "sr-only", "not-sr-only",
+})
+
+_TAILWIND_PATTERNS = [
+    re.compile(r'^(hover|focus|focus-within|focus-visible|active|visited|disabled'
+               r'|checked|indeterminate|placeholder|before|after|first-line|first-letter'
+               r'|marker|selection|dark|rtl|ltr'
+               r'|sm|md|lg|xl|2xl|3xl):'),           # 响应式 / 伪类 / 暗色前缀
+    re.compile(r'^(flex|grid|block|inline-block|inline-flex|inline-grid'
+               r'|inline|hidden|table|flow-root|contents)$'),  # 纯显示原语
+    re.compile(r'^(p|m|px|py|mx|my|pt|pb|pl|pr|mt|mb|ms|me|gap|space)-'),  # 间距
+    re.compile(r'^(w|h|min-w|min-h|max-w|max-h|size)-'),                    # 尺寸
+    re.compile(r'^(text|font|leading|tracking|whitespace|break|truncate'
+               r'|overflow-ellipsis|line-clamp)-'),             # 排版
+    re.compile(r'^(bg|from|to|via|gradient)-'),                 # 背景 / 渐变
+    re.compile(r'^(border|outline|ring|divide)-'),              # 边框（带修饰符）
+    re.compile(r'^(rounded|shadow|opacity|mix-blend|bg-blend)-'),  # 视觉
+    re.compile(r'^(flex|grid|col|row|order|place|items|justify|self|content)-'),  # 布局
+    re.compile(r'^(overflow|overscroll|scroll|snap)-'),         # 滚动
+    re.compile(r'^(cursor|pointer|select|resize|appearance)-'), # 交互
+    re.compile(r'^(transition|duration|ease|delay|animate)-'),  # 动画
+    re.compile(r'^(z|top|right|bottom|left|inset)-'),           # 定位
+    re.compile(r'^(static|fixed|absolute|relative|sticky)$'),  # position 原语
+    re.compile(r'^(capitalize|uppercase|lowercase|normal-case)$'),
+    re.compile(r'^(italic|not-italic|underline|line-through|no-underline)$'),
+    re.compile(r'^(visible|invisible|collapse)$'),
+    re.compile(r'^(aspect|columns|basis|grow|shrink)-'),
+    re.compile(r'^(object|origin|accent|caret|fill|stroke)-'),
+    re.compile(r'^(list|table|caption|border-collapse|border-separate)$'),
+    re.compile(r'^(float|clear)-'),
+    re.compile(r'-(xs|sm|md|lg|xl|2xl|3xl|4xl|full|screen|auto|none|px)$'),  # 常见尺寸后缀
+    re.compile(r'-\d+$'),          # 以数字结尾: p-4, mt-2, w-64 等
+    re.compile(r'-\[.+\]$'),       # 任意值: w-[200px], text-[#fff]
+]
+
+def _is_tailwind_class(cls: str) -> bool:
+    """判断一个 class 是否是 Tailwind 原子功能类（不适合作为 XPath 锚点）。"""
+    if cls in _TAILWIND_BARE_EXCEPTIONS:
+        return False
+    return any(p.search(cls) for p in _TAILWIND_PATTERNS)
 
 # ─────────────────────────────────────────────────────────
 # Variant class 检测（位置/状态类，不应出现在 XPath 谓词中）
@@ -302,7 +349,7 @@ class AutoScraper(object):
                 # 未在过滤后的兄弟中找到自身，记录为无索引层级（避免丢层）
                 content.insert(0, (gp.name, cls._get_valid_attrs(gp)))
             parent = gp
-        
+
         wanted_attr = getattr(child, "wanted_attr", None)
         # hash 必须包含 wanted_attr，否则同路径不同提取目标的 stack 会被去重
         hash_input = str((content, wanted_attr)).encode()
@@ -529,10 +576,18 @@ class AutoScraper(object):
                     classes = classes.split()
                 # 过滤 variant class（first/odd/active 等位置/状态类）
                 classes = [c for c in classes if not _is_variant_class(c)]
-                for cls in classes:
-                    attr_predicates.append(
-                        f"contains(concat(' ',@class,' '),' {cls} ')"
-                    )
+
+                # 分离稳定 class 和 Tailwind 原子 class
+                stable = [c for c in classes if not _is_tailwind_class(c)]
+
+                if stable:
+                    # 有稳定 class → 用作锚点，重置路径（丢弃前面所有 Tailwind 父节点）
+                    xpath_parts = []
+                    for cls in stable:
+                        attr_predicates.append(
+                            f"contains(concat(' ',@class,' '),' {cls} ')"
+                        )
+                # 全是 Tailwind class → 不加 class 谓词，只保留 tag（靠位置谓词区分）
 
             # ── 构造节点段 ──
             part = tag
