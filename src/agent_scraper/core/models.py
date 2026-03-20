@@ -35,6 +35,15 @@ class PageRules(BaseModel):
     sub_page_url_filter: str | None = None    # URL 过滤关键词，如 "/tree/" 只保留含此的URL
     sub_page_recursive: bool = False          # 是否递归进入子页面的子页面
 
+    def has_traversal(self) -> bool:
+        """是否有任何有效的遍历规则"""
+        return any([
+            self.load_more_selector,
+            self.next_button_selector,
+            self.pagination_url,
+            self.sub_page_selector
+        ])
+
 
 class ParsedTask(BaseModel):
     """解析后的完整任务"""

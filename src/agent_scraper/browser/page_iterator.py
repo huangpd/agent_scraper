@@ -212,31 +212,34 @@ class PageIterator:
             except Exception as e:
                 logger.error("子页面 [%d] 失败: %s", i + 1, e)
 
-    # 常见文件扩展名
+    # 常见文件扩展名（用于过滤非目录链接）
+    # 注意：html/css/scss/less/svg 是网页/样式/图标，不算"文件"，不应过滤
     _FILE_EXTENSIONS = re.compile(
-        r'\.(md|txt|json|jsonl|csv|tsv|xml|yaml|yml|toml|cfg|ini|conf|log'
+        r'\.'
+        r'(?:'
+        # 文本/数据
+        r'md|txt|json|jsonl|csv|tsv|xml|yaml|yml|toml|cfg|ini|conf|log'
+        # 源代码
         r'|py|js|ts|java|c|cpp|h|go|rs|rb|php|sh|bat|ps1'
-        r'|html|css|scss|less'
-        r'|png|jpg|jpeg|gif|svg|ico|webp|bmp'
+        # 图片
+        r'|png|jpg|jpeg|gif|ico|webp|bmp|tiff'
+        # 文档
         r'|pdf|doc|docx|xls|xlsx|ppt|pptx'
+        # 压缩包
         r'|zip|tar|gz|bz2|7z|rar'
+        # 二进制/模型
         r'|bin|exe|dll|so|dylib|whl|safetensors|gguf|pt|onnx'
-        r'|gitattributes|gitignore|gitmodules|dockerignore|editorconfig)$',
+        # dotfiles
+        r'|gitattributes|gitignore|gitmodules|dockerignore|editorconfig'
+        r')$',
         re.I,
     )
 
-    # 已知文件路径模式（如 HuggingFace /blob/、GitHub /blob/）
-    _FILE_PATH_PATTERNS = re.compile(r'/blob/|/raw/')
-
     @classmethod
     def _is_file_url(cls, url: str) -> bool:
-        """判断 URL 是否指向单个文件而非目录/页面"""
+        """判断 URL 是否指向单个文件而非目录/页面（基于扩展名）"""
         path = urlparse(url).path
-        if cls._FILE_PATH_PATTERNS.search(path):
-            return True
-        if cls._FILE_EXTENSIONS.search(path):
-            return True
-        return False
+        return bool(cls._FILE_EXTENSIONS.search(path))
 
     async def _extract_links(self, selector: str, url_attr: str, base_url: str) -> list[str]:
         """从当前页面提取子页面链接"""

@@ -11,18 +11,16 @@ import logging
 import unicodedata
 from dataclasses import dataclass, field
 
-from openai import AsyncOpenAI
-
+from agent_scraper.core.llm import LLMService
 from agent_scraper.core.models import ExtractionGoal
 from agent_scraper.pipeline.context import AgentContext
+from agent_scraper.pipeline.prompts import REPLAN_PROMPT
 
 logger = logging.getLogger(__name__)
-
 
 def _normalize_text(s: str) -> str:
     """归一化文本用于宽松比较：全角→半角、大小写、去空白"""
     return unicodedata.normalize("NFKC", s).strip().lower()
-
 
 @dataclass
 class EvalResult:
@@ -33,33 +31,14 @@ class EvalResult:
     issues: list[str] = field(default_factory=list)
     retry_strategy: str | None = None  # Replanner 建议
 
-
-REPLAN_PROMPT = """\
-你是一个网页采集专家。当前提取任务遇到了质量问题，需要你建议重试策略。
-
-任务目标字段: {fields}
-当前提取结果: {extracted}
-发现的问题: {issues}
-已执行步骤:
-{history}
-已重试次数: {retry_count}/{max_retries}
-
-可选策略（只输出策略名称，不要多余文字）:
-- clear_css_cache   清除缓存的 CSS 选择器和 AutoScraper 模型，让 LLM 重新生成
-- retry_navigate    重新导航并从头提取（页面可能已变化）
-- skip              接受当前结果（无法改善）
-"""
-
-
 class Evaluator:
     """质量评估 + LLM Replanner"""
 
     # 通过阈值，质量评分 ≥ 此值视为通过
     PASS_THRESHOLD = 0.6
 
-    def __init__(self, client: AsyncOpenAI, model: str):
-        self.client = client
-        self.model = model
+    def __init__(self, llm_service: LLMService | None = None):
+        self.llm_service = llm_service or LLMService()
 
     async def evaluate(self, ctx: AgentContext) -> EvalResult:
         """FieldCheck → QualityScore → (失败时) Replanner"""
@@ -179,17 +158,13 @@ class Evaluator:
             max_retries=ctx.max_retries,
         )
         try:
-            resp = await self.client.chat.completions.create(
-                model=self.model,
-                temperature=0,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            strategy = resp.choices[0].message.content.strip().lower()
+            content = await self.llm_service.call(prompt, caller="Evaluator")
+            strategy = content.lower()
             # 清洗：只保留已知策略名
             known = {"clear_css_cache", "retry_navigate", "skip"}
             strategy = strategy if strategy in known else "clear_css_cache"
             logger.info("Replanner 策略: %s", strategy)
             return strategy
         except Exception as e:
-            logger.error("Replanner LLM 调用失败: %s，默认 clear_css_cache", e)
+            logger.error("Replanner 失败: %s，默认 clear_css_cache", e)
             return "clear_css_cache"
