@@ -37,7 +37,7 @@ class Reasoner:
     # ── 主循环 ────────────────────────────────────────────
 
     async def run(self, ctx: AgentContext) -> ScrapedResult:
-        plan = self._create_default_plan(ctx.task)
+        plan = self._create_default_plan(ctx.task, has_images=bool(ctx.images))
         logger.info("[Reasoner] 初始计划: %s", [s["tool"] for s in plan])
 
         for attempt in range(ctx.max_retries):
@@ -166,11 +166,22 @@ class Reasoner:
     # ── 计划生成 ──────────────────────────────────────────
 
     @staticmethod
-    def _create_default_plan(task) -> list[dict]:
+    def _create_default_plan(task, has_images: bool = False) -> list[dict]:
         """根据任务类型生成默认执行计划（不含 format，format 在循环外统一执行）"""
         if task.mode == "capture":
             return [{"tool": "capture_navigate"}]
-        # 自由模式（无样本）: browser-use Agent 提取
+
+        # 无样本 + 有截图 → 用 VLM 从截图生成样本，然后走 AutoScraper 路径
+        if not task.extraction_goal.samples and has_images:
+            return [
+                {"tool": "navigate"},
+                {"tool": "vision_sample"},
+                {"tool": "discover_rules"},
+                {"tool": "iterate_pages"},
+                {"tool": "extract"},
+            ]
+
+        # 自由模式（无样本、无截图）: browser-use Agent 提取
         if not task.extraction_goal.samples:
             # 有遍历提示时仍需发现规则和翻页（每页由 Agent 提取）
             if task.extraction_goal.traversal_hints:

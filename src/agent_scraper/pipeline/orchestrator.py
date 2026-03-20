@@ -22,6 +22,7 @@ from agent_scraper.pipeline.tools import (
     IteratePagesTool,
     NavigateTool,
     ToolRegistry,
+    VisionSampleTool,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class AgentScraper:
         self.registry.register(DiscoverRulesTool(rule_discoverer))
         self.registry.register(IteratePagesTool(extractor))
         self.registry.register(ExtractTool(extractor))
+        self.registry.register(VisionSampleTool(self.llm_service))
         self.registry.register(FormatTool(formatter))
 
         # ── 4. 评估器 + 推理器 ──

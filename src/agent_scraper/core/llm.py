@@ -58,3 +58,54 @@ class LLMService:
         except Exception as e:
             logger.error("[%s][#%s] Failed (%.2fs): %s", caller, trace_id, time.perf_counter() - start_time, str(e))
             raise
+
+    async def call_with_images(self, prompt: str, images: list[str], caller: str = "LLM") -> str:
+        """多模态调用接口：文本 + 图片（OpenAI vision 格式）
+
+        Args:
+            prompt: 文本提示词
+            images: 图片列表，每项为 base64 data URL 或 http(s) URL
+            caller: 调用方标识（用于日志）
+        """
+        import base64
+        import mimetypes
+
+        trace_id = get_trace_id()
+        increment_llm_count()
+        start_time = time.perf_counter()
+
+        logger.info("[%s][#%s] VisionPrompt (%d images): %s...", caller, trace_id, len(images), prompt[:100].replace("\n", " "))
+
+        # 构建 content 数组
+        content: list[dict] = [{"type": "text", "text": prompt}]
+        for img in images:
+            if img.startswith("data:"):
+                data_url = img
+            elif img.startswith(("http://", "https://")):
+                data_url = img
+            else:
+                # 本地文件路径 → base64 data URL
+                mime = mimetypes.guess_type(img)[0] or "image/png"
+                with open(img, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+                data_url = f"data:{mime};base64,{b64}"
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": data_url, "detail": "high"},
+            })
+
+        messages = [{"role": "user", "content": content}]
+
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                temperature=0.0,
+                messages=messages,
+            )
+            result = resp.choices[0].message.content.strip()
+            duration = time.perf_counter() - start_time
+            logger.info("[%s][#%s] VisionSuccess (%.2fs): %s...", caller, trace_id, duration, result[:500].replace("\n", " "))
+            return result
+        except Exception as e:
+            logger.error("[%s][#%s] VisionFailed (%.2fs): %s", caller, trace_id, time.perf_counter() - start_time, str(e))
+            raise

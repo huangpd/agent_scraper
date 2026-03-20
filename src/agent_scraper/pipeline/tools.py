@@ -474,6 +474,148 @@ class ExtractTool(Tool):
         self._extractor._trained_scraper = None
 
 
+class VisionSampleTool(Tool):
+    """从截图标注区域识别文字 → 反查 HTML href → 生成 AutoScraper 样本
+
+    职责分离：
+    - VLM 只负责识别可见文本字段（title、日期、价格等）
+    - URL 类字段由代码处理：复用关联文本字段的样本 → href 反查
+    """
+
+    name = "vision_sample"
+    description = "用 VLM 从截图识别标注区域文字，生成 AutoScraper 所需的样本数据"
+
+    def __init__(self, llm_service):
+        self._llm = llm_service
+
+    async def execute(self, ctx: AgentContext, **params) -> ToolResult:
+        import json
+        from agent_scraper.pipeline.prompts import VISION_SAMPLE_PROMPT
+
+        if not ctx.images:
+            return ToolResult(success=False, error="无截图", summary="VisionSample: 无截图，跳过")
+
+        fields = ctx.task.extraction_goal.fields
+
+        # 1. 分离：文本字段交给 VLM，URL 字段由代码处理
+        text_fields = {k: v for k, v in fields.items() if not self._is_url_field(k, v)}
+        url_fields = {k: v for k, v in fields.items() if self._is_url_field(k, v)}
+
+        if not text_fields:
+            # 全是 URL 字段，没有文本字段可供 VLM 识别 → 跳过
+            return ToolResult(
+                success=True, error="所有字段均为 URL 类型，无法从截图生成样本",
+                summary="VisionSample: 无文本字段，跳过",
+            )
+
+        fields_desc = "\n".join(f"- {k}: {v}" for k, v in text_fields.items())
+        prompt = VISION_SAMPLE_PROMPT.format(fields_desc=fields_desc)
+
+        try:
+            # 2. VLM 只识别文本字段
+            raw = await self._llm.call_with_images(prompt, ctx.images, caller="VisionSample")
+            if "```" in raw:
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+            visible_samples: dict[str, list[str]] = json.loads(raw)
+            logger.info("[VisionSample] VLM 识别结果: %s", visible_samples)
+
+            # 3. URL 字段：复用关联文本字段的样本 → href 反查
+            if url_fields and ctx.html:
+                anchor_texts = self._pick_anchor_texts(visible_samples, text_fields)
+                if anchor_texts:
+                    for url_field in url_fields:
+                        resolved = self._resolve_hrefs(anchor_texts, ctx.html)
+                        visible_samples[url_field] = resolved
+                        logger.info("[VisionSample] URL 字段 '%s': %s → %s", url_field, anchor_texts, resolved)
+
+            # 4. 写入 samples
+            ctx.task.extraction_goal.samples = visible_samples
+            field_info = {k: len(v) for k, v in visible_samples.items()}
+            return ToolResult(
+                success=True,
+                data=visible_samples,
+                summary=f"VisionSample 生成样本: {field_info}",
+            )
+        except Exception as e:
+            logger.warning("[VisionSample] 失败，降级为无样本模式: %s", e)
+            return ToolResult(
+                success=True,  # 不阻断流程，降级为无样本
+                error=str(e),
+                summary=f"VisionSample 失败，将走 Agent 兜底: {e}",
+            )
+
+    # ── 字段分类 ──────────────────────────────────────────
+
+    @staticmethod
+    def _is_url_field(field_name: str, field_desc: str) -> bool:
+        """判断字段是否为 URL 类型"""
+        indicators = ["url", "链接", "link", "href"]
+        text = (field_name + " " + field_desc).lower()
+        return any(kw in text for kw in indicators)
+
+    @staticmethod
+    def _pick_anchor_texts(
+        visible_samples: dict[str, list[str]],
+        text_fields: dict[str, str],
+    ) -> list[str]:
+        """从 VLM 识别的文本字段中，选出最适合做 href 反查的锚文本。
+
+        优先选 title/标题/name 等字段（这些通常是 <a> 的锚文本），
+        否则取第一个有值的文本字段。
+        """
+        title_keywords = ["title", "标题", "name", "名称"]
+        # 优先找 title 类字段
+        for field_name in visible_samples:
+            if field_name not in text_fields:
+                continue
+            combined = (field_name + " " + text_fields[field_name]).lower()
+            if any(kw in combined for kw in title_keywords):
+                return visible_samples[field_name]
+        # 兜底：取第一个有值的字段
+        for values in visible_samples.values():
+            if values:
+                return values
+        return []
+
+    # ── href 反查 ─────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_hrefs(anchor_texts: list[str], html: str) -> list[str]:
+        """用可见文字列表在 HTML 中反查 <a> href"""
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html, "html.parser")
+        resolved = []
+        for text in anchor_texts:
+            href = VisionSampleTool._find_href_by_text(soup, text.strip())
+            if href:
+                resolved.append(href)
+                logger.info("[VisionSample] href 反查: '%s' → '%s'", text, href)
+            else:
+                logger.warning("[VisionSample] href 反查失败: '%s'，跳过", text)
+        return resolved
+
+    @staticmethod
+    def _find_href_by_text(soup, text: str) -> str | None:
+        """在 HTML 中找包含指定文字的 <a> 标签，返回 href"""
+        # 策略1: 直接在 <a> 标签文本中匹配
+        for a_tag in soup.find_all("a", href=True):
+            if text in a_tag.get_text(strip=True):
+                return a_tag["href"]
+        # 策略2: 搜索所有文本节点，向上找最近的 <a> 祖先
+        import re
+        for text_node in soup.find_all(string=re.compile(re.escape(text))):
+            parent = text_node.parent
+            while parent:
+                if parent.name == "a" and parent.get("href"):
+                    return parent["href"]
+                parent = parent.parent
+        return None
+
+
 class FormatTool(Tool):
     """将提取的原始数据格式化为最终 ScrapedResult"""
 
