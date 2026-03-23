@@ -1,7 +1,12 @@
 __pycache__/
 *.pyc
 .env
-*.json
+# *.json (Too broad, blocking package.json)
+results/
+data/
+outputs/
+*.json.log
+
 
 # Virtual environment
 .venv/
