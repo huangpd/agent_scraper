@@ -148,6 +148,9 @@ class AutoScraper(object):
 
     def __init__(self, stack_list=None):
         self.stack_list = stack_list or []
+        self._ml_active = False
+        self._ml_classifiers: dict = {}  # {alias: (clf, vocab, all_nodes, all_features)}
+        self._xpath_overrides: dict[str, str] = {}  # 外部直接注入的 XPath 规则
 
     # ── 持久化 ──────────────────────────────────────────
 
@@ -222,6 +225,8 @@ class AutoScraper(object):
         # Step 2: ML fallback — 规则模式未找到结果时启用
         if not self.stack_list and use_ml and _ML_AVAILABLE:
             logger.info("规则模式未找到结果，切换到 ML 模式...")
+            self._ml_active = True
+            self._ml_wanted_dict = _wdict
             self._ml_build_stacks(soup, url, _wdict, text_fuzz_ratio)
             self.stack_list = unique_stack_list(self.stack_list)
 
@@ -266,10 +271,16 @@ class AutoScraper(object):
             if text_match(text, v, fuzz):
                 child.wanted_attr = k
                 return True
-            # URL 宽松匹配：完整 URL 样本 vs 相对路径属性值
-            if k in ("href", "src") and url:
-                full_url = urljoin(url, v)
-                if text_match(text, full_url, fuzz):
+            if k in ("href", "src"):
+                # 正向：样本是完整 URL，HTML 是相对路径（需要 base url 拼接）
+                if url:
+                    full_url = urljoin(url, v)
+                    if text_match(text, full_url, fuzz):
+                        child.wanted_attr = k
+                        return True
+                # 反向：样本是相对路径，HTML 是完整 URL（浏览器渲染场景，不依赖 url 参数）
+                parsed = urlparse(v)
+                if parsed.scheme and text.startswith("/") and parsed.path == text:
                     child.wanted_attr = k
                     return True
         return False
@@ -302,7 +313,7 @@ class AutoScraper(object):
                 # 未在过滤后的兄弟中找到自身，记录为无索引层级（避免丢层）
                 content.insert(0, (gp.name, cls._get_valid_attrs(gp)))
             parent = gp
-        
+
         wanted_attr = getattr(child, "wanted_attr", None)
         # hash 必须包含 wanted_attr，否则同路径不同提取目标的 stack 会被去重
         hash_input = str((content, wanted_attr)).encode()
@@ -448,6 +459,8 @@ class AutoScraper(object):
             stack["alias"] = alias
             self.stack_list.append(stack)
 
+            self._ml_classifiers[alias] = (clf, vocab)
+
             xpath = self._stack_to_xpath(stack)
             logger.info(
                 "alias='%s' ML → XPath: %s  (代表节点: <%s> prob=%.3f)",
@@ -459,12 +472,14 @@ class AutoScraper(object):
         return self.get_result_xpath_rule()
 
     def get_result_xpath_rule(self, url=None):
-        if not self.stack_list: return {}
+        if not self.stack_list and not self._xpath_overrides:
+            return {}
         rules = {}
         for stack in self.stack_list:
             alias = stack.get("alias", "default")
             if alias not in rules:
                 rules[alias] = self._stack_to_xpath(stack)
+        rules.update(self._xpath_overrides)
         return rules
 
     def _stack_to_xpath(self, stack):
