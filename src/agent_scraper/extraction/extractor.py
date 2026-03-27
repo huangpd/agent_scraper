@@ -1,6 +1,8 @@
 import json
 import logging
 from html import unescape
+from urllib.parse import urlparse
+
 from bs4 import BeautifulSoup
 
 from agent_scraper.core.llm import LLMService
@@ -59,23 +61,46 @@ class Extractor:
         # 执行深度清洗：剔除 JS/CSS/SVG 等
         normalized_html = self._clean_html(html)
 
+        has_samples = bool(goal.samples)
+
         # 1. AutoScraper 路径 (机器学习)
         if not self._trained_scraper:
             wanted_dict = goal.samples if goal.samples else {}
             if wanted_dict:
+                # 展开 URL 样本：完整 URL → 同时包含相对路径版本，方便匹配 HTML 中的 href
+                wanted_dict = self._expand_url_samples(wanted_dict)
+                logger.info("[Extractor] 策略: AutoScraper (ML) — 有样本 %s",
+                            {k: len(v) for k, v in wanted_dict.items()})
                 scraper = AutoScraper()
                 # 使用规范化后的 HTML 进行训练
                 scraper.build(html=normalized_html, wanted_dict=wanted_dict)
+                # 打印学到的 XPath 规则
+                rules = scraper.get_result_xpath_rule()
+                if rules:
+                    logger.info("[Extractor] AutoScraper 训练完成，学到 %d 条 XPath 规则:", len(rules))
+                    for alias, xpath in rules.items():
+                        logger.info("[Extractor]   %s → %s", alias, xpath)
+                else:
+                    logger.warning("[Extractor] AutoScraper 训练完成，但未学到任何 XPath 规则")
                 # URL 字段：从文本字段 XPath 推导 /@href
                 self._derive_url_rules(scraper, goal)
                 self._trained_scraper = scraper
+            else:
+                logger.info("[Extractor] 无样本，跳过 AutoScraper")
+
         if self._trained_scraper:
             # 同样使用规范化后的 HTML 进行提取
             as_result = self._trained_scraper.get_result_similar(html=normalized_html, group_by_alias=True)
-            if any(len(v) > 0 for v in as_result.values()):
+            result_counts = {k: len(v) for k, v in as_result.items()}
+            total = sum(result_counts.values())
+            if total > 0:
+                logger.info("[Extractor] AutoScraper 提取成功: %s", result_counts)
                 return as_result
+            else:
+                logger.warning("[Extractor] AutoScraper 提取结果为空，降级到 LLM CSS 选择器")
 
         # 2. 简单 CSS 兜底（带缓存）
+        logger.info("[Extractor] 策略: LLM CSS 选择器 (兜底)")
         return await self._css_selector_extract(normalized_html, goal, expected_fields)
 
     # ── URL 字段 XPath 推导 ────────────────────────────────
@@ -125,6 +150,39 @@ class Extractor:
             logger.info("[Extractor] URL 字段 '%s' XPath 推导: %s", url_field, href_xpath)
 
     @staticmethod
+    def _expand_url_samples(wanted_dict: dict[str, list[str]]) -> dict[str, list[str]]:
+        """展开 URL 样本：用户提供完整 URL 时，追加相对路径版本。
+
+        用户从浏览器复制的样本通常是完整 URL:
+            https://example.com/data/file.csv?download=true
+        但 HTML 中 href 往往是相对路径:
+            /data/file.csv?download=true
+        AutoScraper 需要匹配 HTML 中的实际文本，所以要把两个版本都给它。
+        """
+        expanded = {}
+        for field, values in wanted_dict.items():
+            seen = set(values)
+            new_values = list(values)
+            for val in values:
+                if not isinstance(val, str) or not val.startswith("http"):
+                    continue
+                parsed = urlparse(val)
+                # 相对路径 = path + query + fragment
+                relative = parsed.path
+                if parsed.query:
+                    relative += "?" + parsed.query
+                if parsed.fragment:
+                    relative += "#" + parsed.fragment
+                if relative and relative not in seen:
+                    new_values.append(relative)
+                    seen.add(relative)
+            if len(new_values) > len(values):
+                logger.info("[Extractor] URL 样本展开: %s 增加 %d 个相对路径",
+                            field, len(new_values) - len(values))
+            expanded[field] = new_values
+        return expanded
+
+    @staticmethod
     def _xpath_to_href(xpath: str) -> str | None:
         """从文本字段 XPath 推导 URL XPath。
 
@@ -158,7 +216,14 @@ class Extractor:
             if "```" in content:
                 content = content.split("```")[1].replace("json", "").strip()
             selectors = json.loads(content)
-            return self._apply_css_selectors(html, selectors)
+            logger.info("[Extractor] LLM 生成 CSS 选择器:")
+            for field, info in selectors.items():
+                logger.info("[Extractor]   %s → selector='%s', attr='%s'",
+                            field, info.get("selector", "?"), info.get("attr", "text"))
+            result = self._apply_css_selectors(html, selectors)
+            result_counts = {k: len(v) for k, v in result.items()}
+            logger.info("[Extractor] CSS 选择器提取结果: %s", result_counts)
+            return result
         except Exception as e:
             logger.warning("CSS 选择器提取失败: %s", e)
             return {}

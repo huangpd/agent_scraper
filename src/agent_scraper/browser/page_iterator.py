@@ -4,7 +4,6 @@
 """
 
 import asyncio
-import json as json_mod
 import logging
 import re
 from collections.abc import AsyncGenerator
@@ -23,35 +22,100 @@ class PageIterator:
         """browser: browser_use BrowserSession"""
         self.browser = browser
 
-    async def _get_page(self):
-        """每次操作前重新获取当前 page，防止引用失效"""
-        page = await self.browser.get_current_page()
-        if not page:
-            raise RuntimeError("浏览器页面丢失")
-        return page
+    async def _get_page(self, retries: int = 3):
+        """每次操作前重新获取当前 page，防止引用失效。
 
-    async def _eval(self, js: str) -> str:
-        """安全执行 JS evaluate"""
-        page = await self._get_page()
-        return await page.evaluate(js)
+        恢复策略（按优先级）：
+        1. 快速路径：直接获取
+        2. 协同 SessionManager：等待其自动恢复 detached target（事件驱动，非轮询）
+        3. 传统重试：兼容无 SessionManager 的场景
+        4. 已有标签页兜底
+        5. 创建新标签页
+        """
+        # 快速路径
+        page = await self.browser.get_current_page()
+        if page:
+            return page
+
+        # 等待 SessionManager 自动恢复（协同而非赛跑）
+        sm = getattr(self.browser, 'session_manager', None)
+        if sm:
+            logger.info("页面丢失，等待 SessionManager 恢复...")
+            try:
+                recovered = await sm.ensure_valid_focus(timeout=5.0)
+                if recovered:
+                    page = await self.browser.get_current_page()
+                    if page:
+                        logger.info("SessionManager 恢复成功")
+                        return page
+            except Exception as e:
+                logger.warning("SessionManager 恢复异常: %s", e)
+
+        # 恢复失败，传统重试（兼容无 SessionManager 的场景）
+        for attempt in range(retries):
+            await asyncio.sleep(2)
+            page = await self.browser.get_current_page()
+            if page:
+                return page
+            logger.warning("页面丢失，重试 %d/%d", attempt + 1, retries)
+
+        # 尝试从已有标签页恢复
+        pages = await self.browser.get_pages()
+        if pages:
+            logger.info("从已有标签页恢复 (共 %d 个)", len(pages))
+            return pages[-1]
+
+        # 创建新标签页
+        try:
+            page = await self.browser.new_page("about:blank")
+            logger.info("手动创建新标签页恢复成功")
+            return page
+        except Exception as e:
+            raise RuntimeError(f"浏览器页面丢失且无法恢复: {e}")
 
     async def _goto(self, url: str):
-        """导航到 URL"""
-        page = await self._get_page()
-        await page.goto(url)
+        """导航到 URL，带 target detach 恢复"""
+        try:
+            page = await self._get_page()
+            await page.goto(url)
+        except Exception as e:
+            err = str(e)
+            if "-32000" in err or "detach" in err.lower() or "session" in err.lower():
+                logger.warning("导航时 target 丢失，尝试用新标签页恢复: %s", err)
+                await asyncio.sleep(2)
+                page = await self._get_page()
+                await page.goto(url)
+            else:
+                raise
         await asyncio.sleep(2)
 
     async def _get_html(self) -> str:
-        return await self._eval("() => document.documentElement.outerHTML")
+        page = await self._get_page()
+        return await page.evaluate("() => document.documentElement.outerHTML")
 
-    async def iterate(self, first_html: str, rules: PageRules, base_url: str = "") -> AsyncGenerator[str, None]:
+    async def iterate(
+        self, first_html: str, rules: PageRules, base_url: str = "",
+        load_more_text: str | None = None,
+        next_button_text: str | None = None,
+    ) -> AsyncGenerator[str, None]:
         """根据规则遍历所有页面，逐页 yield HTML（流式，不缓存）"""
         max_pages = rules.pagination_max
 
-        # 1. load_more: 仅在有明确选择器时执行（避免误点击无关按钮）
-        if rules.load_more_selector:
-            await self._try_load_more(rules.load_more_selector)
-            first_html = await self._get_html()
+        # 1. load_more: XPath（AutoScraper ML 动态发现）→ CSS selector → 文本兜底
+        load_more_selector = rules.load_more_selector
+        load_more_xpath = None
+
+        # 有按钮文本 → 在当前页用 AutoScraper 发现 XPath
+        if load_more_text:
+            load_more_xpath = self._find_load_more_xpath(first_html, load_more_text)
+
+        if load_more_xpath or load_more_selector:
+            await self._try_load_more(selector=load_more_selector, xpath=load_more_xpath,
+                                      button_text=load_more_text or "")
+            try:
+                first_html = await self._get_html()
+            except Exception as e:
+                logger.warning("load_more 后获取 HTML 失败，使用原始页面: %s", e)
 
         # 2. sub_pages: 递归遍历子页面
         if rules.sub_page_selector:
@@ -60,7 +124,8 @@ class PageIterator:
                 selector=rules.sub_page_selector,
                 url_attr=rules.sub_page_url_attr,
                 url_filter=rules.sub_page_url_filter,
-                load_more_selector=rules.load_more_selector,
+                load_more_selector=load_more_selector,
+                load_more_text=load_more_text,
                 base_url=base_url,
             ):
                 yield html
@@ -71,10 +136,14 @@ class PageIterator:
             async for html in self._do_pagination_url(rules.pagination_url, max_pages or DEFAULT_MAX_PAGES):
                 yield html
 
-        # 4. next_button 翻页
-        elif rules.next_button_selector:
+        # 4. next_button 翻页: selector 优先，文本兜底
+        elif rules.next_button_selector or next_button_text:
             yield first_html
-            async for html in self._do_next_button(rules.next_button_selector, max_pages):
+            async for html in self._do_next_button(
+                selector=rules.next_button_selector,
+                button_text=next_button_text,
+                max_pages=max_pages,
+            ):
                 yield html
 
         # 5. 无规则: 单页
@@ -83,59 +152,133 @@ class PageIterator:
 
     # ── load_more ────────────────────────────────────────
 
-    async def _try_load_more(self, selector: str | None, max_clicks: int = 50):
-        """尝试点击 Load more 按钮。有选择器用选择器，没有用通用文本匹配"""
+    async def _try_load_more(self, selector: str | None = None, xpath: str | None = None,
+                             button_text: str = "", max_clicks: int = 50):
+        """尝试点击 Load more 按钮。通过 JS evaluate 定位并点击。
+        优先级: XPath(含button_text过滤) → CSS selector → 文本匹配
+
+        浏览器崩溃时内部 catch，不向上抛异常，保证 iterate() 流程继续。
+        """
         click_count = 0
         prev_height = 0
-        while click_count < max_clicks:
-            js = self._build_load_more_js(selector)
-            result = await self._eval(js)
-            if result != "clicked":
-                break
-            click_count += 1
-            if click_count % 5 == 0:
-                logger.info("load_more 已点击 %d 次...", click_count)
-            await asyncio.sleep(1.5)
-            # 检测页面是否有变化（防止按钮始终可见的死循环）
-            cur_height = await self._eval("() => document.body.scrollHeight")
-            if cur_height == prev_height:
-                logger.info("load_more 页面无变化，停止")
-                break
-            prev_height = cur_height
+        use_xpath = bool(xpath)
+        try:
+            while click_count < max_clicks:
+                page = await self._get_page()
+                clicked = False
+
+                # 1. XPath 定位（AutoScraper 发现）
+                if use_xpath:
+                    clicked = await self._click_by_xpath(page, xpath, button_text)
+                    if not clicked:
+                        if click_count > 0:
+                            # XPath 之前成功过，按钮消失说明加载完成，直接结束
+                            break
+                        logger.info("load_more XPath 未命中，降级到 CSS/文本匹配")
+                        use_xpath = False
+
+                # 2. CSS selector 定位
+                if not clicked and selector:
+                    clicked = await self._click_by_selector(page, selector)
+
+                # 3. 用户指定的按钮文本
+                if not clicked and button_text:
+                    clicked = await self._click_by_text(page, button_text)
+
+                if not clicked:
+                    break
+
+                click_count += 1
+                if click_count % 5 == 0:
+                    logger.info("load_more 已点击 %d 次...", click_count)
+                await asyncio.sleep(1.5)
+
+                # 检测页面是否有变化（防止按钮始终可见的死循环）
+                cur_height = int(await page.evaluate("() => document.body.scrollHeight"))
+                if cur_height == prev_height:
+                    logger.info("load_more 页面无变化，停止")
+                    break
+                prev_height = cur_height
+        except Exception as e:
+            if click_count > 0:
+                logger.warning("load_more 浏览器异常，已点击 %d 次后停止: %s", click_count, e)
+            else:
+                logger.info("load_more 按钮未找到，跳过")
+            return
+
         if click_count >= max_clicks:
             logger.warning("load_more 达到上限 %d 次，停止", max_clicks)
         elif click_count > 0:
             logger.info("load_more 完成，共点击 %d 次", click_count)
 
+    # ── JS evaluate 点击辅助方法 ──────────────────────────
+
     @staticmethod
-    def _build_load_more_js(selector: str | None) -> str:
-        """构建 Load more 点击的 JS"""
-        if selector:
-            safe_sel = selector.replace("'", "\\'")
-            return (
-                f"() => {{"
-                f"  let btn = document.querySelector('{safe_sel}');"
-                f"  if (!btn || btn.offsetParent === null) {{"
-                f"    const all = [...document.querySelectorAll('button, a')];"
-                f"    btn = all.find(e => /load more|加载更多|show more/i.test(e.textContent.trim()));"
-                f"  }}"
-                f"  if (btn && btn.offsetParent !== null) {{"
-                f"    btn.scrollIntoView(); btn.click(); return 'clicked';"
-                f"  }}"
-                f"  return 'not_found';"
-                f"}}"
-            )
-        else:
-            return (
-                "() => {"
-                "  const all = [...document.querySelectorAll('button, a')];"
-                "  const btn = all.find(e => /load more|加载更多|show more|load more files/i.test(e.textContent.trim()));"
-                "  if (btn && btn.offsetParent !== null) {"
-                "    btn.scrollIntoView(); btn.click(); return 'clicked';"
-                "  }"
-                "  return 'not_found';"
-                "}"
-            )
+    async def _click_by_xpath(page, xpath: str, text_filter: str = "") -> bool:
+        """通过 XPath 定位并点击元素（JS evaluate）。
+        AutoScraper 可能匹配到容器元素（li/div/span），而非实际可点击的 button/a，
+        因此匹配到非可点击标签时，优先在子元素中查找 button/a/input 点击。
+        """
+        result = await page.evaluate("""(xpath, textFilter) => {
+            const CLICKABLE = new Set(['BUTTON','A','INPUT']);
+            const iter = document.evaluate(xpath, document, null,
+                XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+            for (let i = 0; i < iter.snapshotLength; i++) {
+                const el = iter.snapshotItem(i);
+                if (textFilter && !el.textContent.includes(textFilter)) continue;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                // 如果元素本身不是可点击标签，优先找子元素中的 button/a/input
+                let target = el;
+                if (!CLICKABLE.has(el.tagName)) {
+                    const child = el.querySelector('button, a, input[type="button"], input[type="submit"]');
+                    if (child) target = child;
+                }
+                target.scrollIntoView({block: 'center'});
+                target.click();
+                return 'clicked';
+            }
+            return '';
+        }""", xpath, text_filter)
+        return result == "clicked"
+
+    @staticmethod
+    async def _click_by_selector(page, selector: str) -> bool:
+        """通过 CSS selector 定位并点击第一个可见元素（JS evaluate）"""
+        result = await page.evaluate("""(selector) => {
+            try {
+                const els = document.querySelectorAll(selector);
+                for (const el of els) {
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    el.scrollIntoView({block: 'center'});
+                    el.click();
+                    return 'clicked';
+                }
+            } catch(e) {}
+            return '';
+        }""", selector)
+        return result == "clicked"
+
+    @staticmethod
+    async def _click_by_text(page, text: str) -> bool:
+        """通过文本匹配点击按钮或链接（JS evaluate）"""
+        result = await page.evaluate("""(text) => {
+            const els = document.querySelectorAll(
+                'button, a, [role="button"], [role="link"], '
+                + 'input[type="button"], input[type="submit"]');
+            const lower = text.toLowerCase();
+            for (const el of els) {
+                if (!el.textContent.trim().toLowerCase().includes(lower)) continue;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                el.scrollIntoView({block: 'center'});
+                el.click();
+                return 'clicked';
+            }
+            return '';
+        }""", text)
+        return result == "clicked"
 
     # ── sub_pages (真正递归) ─────────────────────────────
 
@@ -145,6 +288,7 @@ class PageIterator:
         url_attr: str,
         url_filter: str | None = None,
         load_more_selector: str | None = None,
+        load_more_text: str | None = None,
         base_url: str = "",
         visited: set | None = None,
         depth: int = 0,
@@ -190,8 +334,15 @@ class PageIterator:
             try:
                 await self._goto(url)
 
+                # 每个子页面动态发现 load_more XPath（按钮在不同页面可能结构不同）
+                page_xpath = None
+                if load_more_text:
+                    html = await self._get_html()
+                    page_xpath = self._find_load_more_xpath(html, load_more_text)
+
                 # 每个子页面都尝试 Load more
-                await self._try_load_more(load_more_selector)
+                await self._try_load_more(selector=load_more_selector, xpath=page_xpath,
+                                          button_text=load_more_text or "")
 
                 html = await self._get_html()
                 yield html
@@ -202,6 +353,7 @@ class PageIterator:
                     url_attr=url_attr,
                     url_filter=url_filter,
                     load_more_selector=load_more_selector,
+                    load_more_text=load_more_text,
                     base_url=url,
                     visited=visited,
                     depth=depth + 1,
@@ -210,6 +362,11 @@ class PageIterator:
                     yield deeper_html
 
             except Exception as e:
+                err = str(e)
+                # 浏览器连接断开是致命错误，不要继续尝试后续子页面
+                if "无法恢复" in err or "Failed to open" in err or "-32000" in err:
+                    logger.error("子页面 [%d] 浏览器连接丢失，停止遍历: %s", i + 1, e)
+                    return
                 logger.error("子页面 [%d] 失败: %s", i + 1, e)
 
     # 常见文件扩展名（用于过滤非目录链接）
@@ -242,32 +399,20 @@ class PageIterator:
         return bool(cls._FILE_EXTENSIONS.search(path))
 
     async def _extract_links(self, selector: str, url_attr: str, base_url: str) -> list[str]:
-        """从当前页面提取子页面链接"""
-        safe_sel = selector.replace("'", "\\'")
-        safe_attr = url_attr.replace("'", "\\'")
-
-        raw = await self._eval(
-            f"() => {{"
-            f"  const els = document.querySelectorAll('{safe_sel}');"
-            f"  return JSON.stringify([...els].map(el => el.getAttribute('{safe_attr}')).filter(Boolean));"
-            f"}}"
-        )
-
-        try:
-            raw_urls = json_mod.loads(raw) if isinstance(raw, str) else raw
-        except Exception:
-            raw_urls = []
-
-        if not isinstance(raw_urls, list):
-            raw_urls = []
+        """从当前页面提取子页面链接（JS evaluate）"""
+        import json as _json
+        page = await self._get_page()
+        raw = await page.evaluate("""(selector, urlAttr) => {
+            const els = [...document.querySelectorAll(selector)];
+            return els.map(e => e.getAttribute(urlAttr)).filter(Boolean);
+        }""", selector, url_attr)
+        vals = _json.loads(raw) if isinstance(raw, str) and raw.startswith("[") else []
 
         # 补全相对 URL + 去重
-        seen = set()
-        urls = []
-        for u in raw_urls:
-            if not u:
-                continue
-            full = urljoin(base_url, u) if not u.startswith("http") else u
+        seen: set[str] = set()
+        urls: list[str] = []
+        for val in vals:
+            full = urljoin(base_url, val) if not val.startswith("http") else val
             if full not in seen:
                 seen.add(full)
                 urls.append(full)
@@ -295,26 +440,54 @@ class PageIterator:
 
     # ── next_button ──────────────────────────────────────
 
-    async def _do_next_button(self, selector: str, max_pages: int | None = None) -> AsyncGenerator[str, None]:
-        """点击"下一页"翻页。max_pages 为总页数限制（含第1页），None 则不限制。"""
-        # max_extra = 需要额外翻的页数（第1页已有，所以减1）
+    async def _do_next_button(
+        self, selector: str | None = None, button_text: str | None = None,
+        max_pages: int | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """点击"下一页"翻页。优先 CSS selector，失败则按文本匹配兜底。
+        max_pages 为总页数限制（含第1页），None 则不限制。
+        """
         max_extra = (max_pages - 1) if max_pages else DEFAULT_MAX_PAGES
-        logger.info("翻页按钮: %s (最多翻 %d 页)", selector, max_extra)
-        safe_sel = selector.replace("'", "\\'")
+        logger.info("翻页按钮: selector=%s, text=%s (最多翻 %d 页)", selector, button_text, max_extra)
         page_count = 0
         for i in range(max_extra):
-            result = await self._eval(
-                f"() => {{"
-                f"  const btn = document.querySelector('{safe_sel}');"
-                f"  if (btn && btn.offsetParent !== null) {{ btn.click(); return 'clicked'; }}"
-                f"  return 'not_found';"
-                f"}}"
-            )
-            if result != "clicked":
+            page = await self._get_page()
+            clicked = False
+
+            # 1. CSS selector（RuleDiscoverer 发现）
+            if selector:
+                clicked = await self._click_by_selector(page, selector)
+
+            # 2. 用户指定的按钮文本
+            if not clicked and button_text:
+                clicked = await self._click_by_text(page, button_text)
+
+            if not clicked:
                 break
+
             await asyncio.sleep(2)
             yield await self._get_html()
             page_count += 1
             if (i + 1) % 5 == 0:
                 logger.info("已翻 %d 页...", i + 1)
         logger.info("翻页完成，共 %d 个额外页面", page_count)
+
+    # ── AutoScraper 发现 load_more XPath ──────────────────
+
+    @staticmethod
+    def _find_load_more_xpath(html: str, button_text: str) -> str | None:
+        """在当前页面 HTML 上用 AutoScraper 找 load_more 按钮的 XPath"""
+        from autoscraper.auto_scraper import AutoScraper
+
+        try:
+            scraper = AutoScraper()
+            scraper.build(html=html, wanted_dict={"load_more": [button_text]})
+            rules = scraper.get_result_xpath_rule()
+            if rules:
+                xpath = next(iter(rules.values()))
+                logger.info("[PageIterator] AutoScraper 发现 load_more XPath: %s", xpath)
+                return xpath
+            logger.warning("[PageIterator] AutoScraper 未找到 '%s' 的 XPath", button_text)
+        except Exception as e:
+            logger.warning("[PageIterator] AutoScraper 查找 load_more 失败: %s", e)
+        return None

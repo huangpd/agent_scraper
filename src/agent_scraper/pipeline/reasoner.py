@@ -104,12 +104,48 @@ class Reasoner:
         if not ctx.result:
             ctx.result = ScrapedResult(data=[], total_count=0, source_url=ctx.source_url)
 
+        # ── Anomaly Detection: 对 URL 字段运行异常检测 ──
+        if ctx.result.data and len(ctx.result.data) > 3:
+            self._run_anomaly_detection(ctx)
+
         self._emit("result", {
             "data": ctx.result.data,
             "total": ctx.result.total_count,
             "source_url": ctx.result.source_url,
         })
         return ctx.result
+
+    # ── 异常检测 ──────────────────────────────────────────
+
+    def _run_anomaly_detection(self, ctx: AgentContext):
+        """对结果中的 URL 类字段运行异常检测，有异常则发送 anomaly 事件。"""
+        from agent_scraper.extraction.anomaly import detect_anomalies
+
+        url_indicators = ("url", "链接", "link", "href")
+        fields = ctx.task.extraction_goal.fields
+
+        for field_name, field_desc in fields.items():
+            text = (field_name + " " + field_desc).lower()
+            if not any(kw in text for kw in url_indicators):
+                continue
+            entries = [
+                str(r[field_name]) for r in ctx.result.data
+                if r.get(field_name)
+            ]
+            if len(entries) <= 3:
+                continue
+            try:
+                result = detect_anomalies(entries)
+            except Exception as e:
+                logger.warning("[Reasoner] 异常检测失败: %s", e)
+                continue
+            if result["anomaly_count"] > 0:
+                result["field"] = field_name
+                self._emit("anomaly", result)
+                logger.info(
+                    "[Reasoner] 异常检测: 字段 '%s' 发现 %d 条异常",
+                    field_name, result["anomaly_count"],
+                )
 
     # ── 计划执行 ──────────────────────────────────────────
 

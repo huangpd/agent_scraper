@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 
 from agent_scraper.core.llm import LLMService
 from agent_scraper.core.models import PageRules
-from agent_scraper.pipeline.prompts import DISCOVER_PROMPT
+from agent_scraper.pipeline.prompts import DISCOVER_PROMPT, DISCOVER_RETRY_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,73 @@ class RuleDiscoverer:
         except Exception as e:
             logger.error("RuleDiscoverer 失败: %s", e)
             return PageRules()
+
+    async def discover_retry(
+        self, html: str, current_url: str = "",
+        traversal_hints: list[str] | None = None, missing_modes: list[str] | None = None,
+    ) -> PageRules:
+        """用更强硬的重试提示词重新发现缺失的遍历规则"""
+        if not traversal_hints:
+            return PageRules()
+
+        snippet = self._get_clean_snippet(html)
+        missing_desc = ", ".join(missing_modes or traversal_hints)
+
+        prompt = DISCOVER_RETRY_PROMPT.format(
+            missing_modes=missing_desc,
+            current_url=current_url,
+            requested_modes=", ".join(traversal_hints),
+            html_snippet=snippet,
+        )
+
+        try:
+            content = await self.llm_service.call(prompt, caller="RuleDiscoverer.retry")
+            if "```" in content:
+                content = content.split("```")[1].replace("json", "").strip()
+            data = json.loads(content)
+
+            filtered = {}
+            if "load_more" in traversal_hints:
+                filtered["load_more_selector"] = data.get("load_more_selector")
+            if "next_button" in traversal_hints:
+                filtered["next_button_selector"] = data.get("next_button_selector")
+            if "pagination" in traversal_hints:
+                filtered["pagination_url"] = data.get("pagination_url")
+                filtered["pagination_max"] = data.get("pagination_max")
+            if "sub_pages" in traversal_hints:
+                filtered["sub_page_selector"] = data.get("sub_page_selector")
+                filtered["sub_page_url_attr"] = data.get("sub_page_url_attr", "href")
+                filtered["sub_page_url_filter"] = data.get("sub_page_url_filter")
+                filtered["sub_page_recursive"] = data.get("sub_page_recursive", False)
+
+            rules = PageRules(**{k: v for k, v in filtered.items() if v is not None})
+            self._log_rules(rules)
+            return rules
+        except Exception as e:
+            logger.error("RuleDiscoverer 重试失败: %s", e)
+            return PageRules()
+
+    @staticmethod
+    def validate_selectors(html: str, rules: PageRules) -> list[str]:
+        """校验 LLM 返回的 CSS selector 是否在 HTML 中真的有匹配元素（防幻觉）。
+        返回无效的字段名列表，如 ['load_more_selector', 'sub_page_selector']。
+        """
+        soup = BeautifulSoup(html, "lxml")
+        invalid = []
+        for field_name, selector in [
+            ("load_more_selector", rules.load_more_selector),
+            ("next_button_selector", rules.next_button_selector),
+            ("sub_page_selector", rules.sub_page_selector),
+        ]:
+            if not selector:
+                continue
+            try:
+                if not soup.select(selector):
+                    invalid.append(field_name)
+            except Exception:
+                # selector 语法本身有误
+                invalid.append(field_name)
+        return invalid
 
     @staticmethod
     def _log_rules(rules: PageRules):

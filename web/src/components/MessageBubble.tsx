@@ -26,6 +26,37 @@ export function MessageBubble({ msg }: { msg: ChatMessage }) {
     )
   }
 
+  if (msg.type === 'anomaly') {
+    const categories = (msg.data?.categories ?? {}) as Record<string, {
+      label: string; count: number; items: Array<Record<string, string>>
+    }>
+    return (
+      <div className="msg-row msg-left">
+        <div className="bubble bubble-anomaly">
+          <div className="anomaly-header">{msg.content}</div>
+          {Object.entries(categories).map(([cat, group]) => (
+            <div key={cat} className="anomaly-group">
+              <div className="anomaly-group-title">
+                <span className="anomaly-tag">{group.label}</span>
+                <span className="anomaly-count">{group.count} 条</span>
+              </div>
+              <div className="anomaly-items">
+                {group.items.map((item, i) => (
+                  <div key={i} className="anomaly-item">
+                    <span className="anomaly-entry" title={item.entry}>
+                      {item.entry.length > 80 ? item.entry.slice(0, 80) + '\u2026' : item.entry}
+                    </span>
+                    <span className="anomaly-reason">{item.reason}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
   if (msg.type === 'error') {
     return (
       <div className="msg-row msg-left">

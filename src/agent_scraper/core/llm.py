@@ -1,5 +1,6 @@
 """统一 LLM 服务网关 (AOP 层)"""
 
+import json
 import os
 import logging
 import time
@@ -8,6 +9,14 @@ from openai import AsyncOpenAI
 from agent_scraper.core.trace import get_trace_id, increment_llm_count
 
 logger = logging.getLogger(__name__)
+
+
+def _fmt_json(obj) -> str:
+    """安全格式化 JSON，非序列化对象降级为 str"""
+    try:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        return str(obj)
 
 def get_model_name() -> str:
     return os.getenv("MODEL_NAME", "gpt-4o")
@@ -28,13 +37,16 @@ class LLMService:
         increment_llm_count() # 自动累加计数
         start_time = time.perf_counter()
         
-        # 1. 结构化 Prompt 日志 (Trace ID 绑定)
-        logger.info("[%s][#%s] Prompt: %s...", caller, trace_id, prompt[:100].replace("\n", " "))
-        
         messages = []
         if system_msg:
             messages.append({"role": "system", "content": system_msg})
         messages.append({"role": "user", "content": prompt})
+
+        # 1. 完整输入日志
+        logger.info(
+            "[%s][#%s] ── LLM 输入 ──\n  model: %s\n  temperature: %s\n  messages:\n%s",
+            caller, trace_id, self.model, temperature, _fmt_json(messages),
+        )
 
         try:
             # 2. 调用转发
@@ -43,12 +55,15 @@ class LLMService:
                 temperature=temperature,
                 messages=messages,
             )
-            
+
             content = resp.choices[0].message.content.strip()
             duration = time.perf_counter() - start_time
-            
-            # 3. 结果日志
-            logger.info("[%s][#%s] Success (%.2fs): %s...", caller, trace_id, duration, content[:10000].replace("\n", " "))
+
+            # 3. 完整输出日志
+            logger.info(
+                "[%s][#%s] ── LLM 输出 (%.2fs) ──\n%s",
+                caller, trace_id, duration, content,
+            )
             
             # 这里可以扩展 Token 统计逻辑
             # self._record_tokens(resp.usage)
@@ -74,8 +89,6 @@ class LLMService:
         increment_llm_count()
         start_time = time.perf_counter()
 
-        logger.info("[%s][#%s] VisionPrompt (%d images): %s...", caller, trace_id, len(images), prompt[:100].replace("\n", " "))
-
         # 构建 content 数组
         content: list[dict] = [{"type": "text", "text": prompt}]
         for img in images:
@@ -96,6 +109,19 @@ class LLMService:
 
         messages = [{"role": "user", "content": content}]
 
+        # 输入日志（图片只打 URL 前缀，不打完整 base64）
+        log_content = []
+        for part in content:
+            if part["type"] == "text":
+                log_content.append(part)
+            else:
+                url = part["image_url"]["url"]
+                log_content.append({"type": "image_url", "image_url": {"url": url[:80] + "...", "detail": "high"}})
+        logger.info(
+            "[%s][#%s] ── Vision 输入 (%d images) ──\n  model: %s\n  content:\n%s",
+            caller, trace_id, len(images), self.model, _fmt_json(log_content),
+        )
+
         try:
             resp = await self.client.chat.completions.create(
                 model=self.model,
@@ -104,7 +130,10 @@ class LLMService:
             )
             result = resp.choices[0].message.content.strip()
             duration = time.perf_counter() - start_time
-            logger.info("[%s][#%s] VisionSuccess (%.2fs): %s...", caller, trace_id, duration, result[:500].replace("\n", " "))
+            logger.info(
+                "[%s][#%s] ── Vision 输出 (%.2fs) ──\n%s",
+                caller, trace_id, duration, result,
+            )
             return result
         except Exception as e:
             logger.error("[%s][#%s] VisionFailed (%.2fs): %s", caller, trace_id, time.perf_counter() - start_time, str(e))

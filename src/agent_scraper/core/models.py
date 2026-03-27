@@ -21,12 +21,14 @@ class ExtractionGoal(BaseModel):
     # 可选值: "load_more" | "pagination" | "sub_pages" | "next_button"
     traversal_hints: list[str] = []
     max_pages: int | None = None  # 用户指定的最大页数（如"翻到第3页停止"→3）
+    load_more_text: str | None = None  # 用户指定的加载按钮文本（如 "Load more files"、"more>>"）
+    next_button_text: str | None = None  # 用户指定的翻页按钮文本（如 "下一页"、"Next"）
 
 
 class PageRules(BaseModel):
     """LLM 发现的页面遍历规则 — AI 只产出规则，代码执行"""
     # 四种翻页模式，可叠加
-    load_more_selector: str | None = None     # "button:has-text('Load more')"
+    load_more_selector: str | None = None     # CSS 选择器（LLM 发现）
     next_button_selector: str | None = None   # "a.pagination-next"
     pagination_url: str | None = None         # "https://xxx/page/{n}"
     pagination_max: int | None = None         # 最大页数

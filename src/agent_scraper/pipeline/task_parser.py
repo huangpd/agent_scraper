@@ -32,14 +32,21 @@ class TaskParser:
 
         data = json.loads(content)
         
-        # 结构化结果打印 (使用统一 Trace ID)
-        from agent_scraper.core.trace import get_trace_id
-        logger.info("[TaskParser][#%s] Parsed JSON: %s", get_trace_id(), json.dumps(data, indent=2, ensure_ascii=False)[:300])
-
-        steps = [NavigationStep(**s) for s in data["navigation_steps"]]
+        raw_steps = [NavigationStep(**s) for s in data["navigation_steps"]]
         goal_data = data["extraction_goal"]
-        
+
         hints = self._ensure_traversal_hints(goal_data.get("traversal_hints", []), instruction)
+        # LLM 有时会把 load_more / 翻页类操作误放进 navigation_steps，
+        # 这些应该由 PageIterator 处理，不能让 browser-use 先点掉
+        steps, hints, load_more_text, next_button_text = self._strip_traversal_from_steps(raw_steps, hints)
+        # 兜底：从用户原始指令的引号中提取按钮文本
+        if not load_more_text and "load_more" in hints:
+            load_more_text = self._extract_quoted_text(instruction)
+        # next_button_text: LLM 解析 > strip 提取 > 指令引号提取
+        if not next_button_text:
+            next_button_text = goal_data.get("next_button_text")
+        if not next_button_text and "next_button" in hints:
+            next_button_text = self._extract_next_button_text(instruction)
         mode = self._ensure_mode(data.get("mode", "extract"), instruction)
         max_pages = self._ensure_max_pages(goal_data.get("max_pages"), instruction)
 
@@ -50,6 +57,8 @@ class TaskParser:
             samples=samples if samples else None,
             traversal_hints=hints,
             max_pages=max_pages,
+            load_more_text=load_more_text,
+            next_button_text=next_button_text,
         )
 
         return ParsedTask(
@@ -58,6 +67,64 @@ class TaskParser:
             raw_instruction=instruction,
             mode=mode,
         )
+
+    @staticmethod
+    def _strip_traversal_from_steps(
+        steps: list[NavigationStep], hints: list[str],
+    ) -> tuple[list[NavigationStep], list[str], str | None, str | None]:
+        """把 LLM 误放进 navigation_steps 的遍历操作剔除，转入 traversal_hints。
+
+        返回 (clean_steps, hints, load_more_text, next_button_text)。
+        """
+        _LOAD_MORE = re.compile(r"load\s*more|加载更多|show\s*more|全部加载", re.I)
+        _NEXT_PAGE = re.compile(r"下一页|下一頁|next\s*page", re.I)
+        _SCROLL_LOAD = re.compile(r"下滑.*加载|滚动.*加载|scroll.*load", re.I)
+
+        clean_steps: list[NavigationStep] = []
+        load_more_text: str | None = None
+        next_button_text: str | None = None
+        for step in steps:
+            combined = f"{step.target} {step.description}"
+            if step.action in ("click", "scroll"):
+                target = step.target.strip()
+                if _LOAD_MORE.search(combined) or _SCROLL_LOAD.search(combined):
+                    if "load_more" not in hints:
+                        hints.append("load_more")
+                    if target and (_LOAD_MORE.search(target) or _SCROLL_LOAD.search(target)):
+                        load_more_text = target
+                    logger.info("剔除导航步骤 → traversal_hints[load_more]: %s", step.description)
+                    continue
+                if _NEXT_PAGE.search(combined):
+                    if "next_button" not in hints:
+                        hints.append("next_button")
+                    if target and _NEXT_PAGE.search(target):
+                        next_button_text = target
+                    logger.info("剔除导航步骤 → traversal_hints[next_button]: %s", step.description)
+                    continue
+            clean_steps.append(step)
+        return clean_steps, hints, load_more_text, next_button_text
+
+    @staticmethod
+    def _extract_quoted_text(instruction: str) -> str | None:
+        """从指令中提取引号包裹的文本，优先返回像 load_more 按钮的文本"""
+        _LOAD_MORE = re.compile(r"load\s*more|加载更多|show\s*more|全部加载", re.I)
+        matches = re.findall(r'["\u201c\u201d\'](.*?)["\u201c\u201d\']', instruction)
+        # 优先返回匹配 load_more 模式的
+        for m in matches:
+            if _LOAD_MORE.search(m):
+                return m.strip()
+        # 都不匹配则返回第一个
+        return matches[0].strip() if matches else None
+
+    @staticmethod
+    def _extract_next_button_text(instruction: str) -> str | None:
+        """从指令引号中提取翻页按钮文本"""
+        _NEXT_PAGE = re.compile(r"下一页|下一頁|next\s*page", re.I)
+        matches = re.findall(r'["\u201c\u201d\'](.*?)["\u201c\u201d\']', instruction)
+        for m in matches:
+            if _NEXT_PAGE.search(m):
+                return m.strip()
+        return None
 
     @staticmethod
     def _ensure_traversal_hints(hints: list[str], instruction: str) -> list[str]:
