@@ -13,6 +13,8 @@ dependencies = [
     "python-dotenv>=1.0",
     "requests>=2.32",
     "uvicorn>=0.30",
+    "scikit-learn>=1.8.0",
+    "httpx>=0.28.1"
 ]
 
 [project.optional-dependencies]

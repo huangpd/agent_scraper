@@ -1,12 +1,12 @@
+      
 """
-AutoScraper - 基于样本数据自动推导 XPath 规则的网页抓取器
-
-流程：
-  1. build()  — 在训练页面上根据样本数据学习 DOM 路径（stack）
-     · 规则模式：精确文本/属性匹配
-     · ML 模式（fallback）：文本匹配失败时，用随机森林定位目标节点
-  2. _stack_to_xpath()  — 将学到的 stack 反推为精准 XPath 表达式
-  3. get_result_similar() — 在任意页面上应用 XPath 规则提取数据
+AutoScraper - 改进版
+主要改进：
+  1. XPath 锚点策略：data-* > aria-* > role > 稳定ID > 语义class > 结构位置
+  2. Tailwind / 原子CSS 工具类过滤
+  3. 布局通用类过滤（clearfix/container/wrapper 等）
+  4. class 谓词数量上限，防止过度约束
+  5. _get_valid_attrs 扩展：采集 data-* / aria-* 属性
 """
 
 import hashlib
@@ -14,7 +14,6 @@ import json
 import logging
 import re
 from collections import defaultdict
-from difflib import SequenceMatcher
 from html import unescape
 from urllib.parse import urljoin, urlparse
 
@@ -41,6 +40,35 @@ from autoscraper.utils import (
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────
+# 锚点属性优先级（从高到低）
+# ─────────────────────────────────────────────────────────
+# 遇到这些属性时重置 xpath_parts（从锚点重新出发），且不再叠加 class 谓词
+ANCHOR_ATTRS_PRIORITY = [
+    "data-testid",    # 测试专用，开发者有意稳定
+    "data-cy",        # Cypress 测试锚点
+    "data-test",      # 通用测试锚点
+    "data-id",        # 业务 ID
+    "data-key",       # 列表 key
+    "data-type",      # 类型标记
+    "data-name",      # 名称标记
+    "data-target",    # Svelte/Stimulus 等框架的组件标记
+    "data-component", # 组件标记
+    "data-section",   # 区块标记
+    "aria-label",     # 无障碍标签，语义明确
+    "aria-labelledby",
+    "role",           # ARIA role（navigation/main/list 等）
+]
+
+# role 值白名单：只有语义 role 才做锚点，忽略 presentation/none
+_SEMANTIC_ROLES = frozenset({
+    "main", "navigation", "complementary", "banner", "contentinfo",
+    "search", "form", "region", "list", "listitem",
+    "table", "row", "cell", "columnheader", "rowheader",
+    "article", "dialog", "alert", "status", "tab", "tabpanel",
+    "button", "link", "menuitem", "option", "treeitem",
+})
+
+# ─────────────────────────────────────────────────────────
 # 哈希 class 检测
 # ─────────────────────────────────────────────────────────
 _HASHED_PATTERNS = [
@@ -58,60 +86,65 @@ def _is_hashed_class(cls: str) -> bool:
                 return True
     return False
 
-def _stable_classes(classes) -> list:
-    if not classes: return []
-    if isinstance(classes, str): classes = classes.split()
-    return [c for c in classes if not _is_hashed_class(c) and not _is_tailwind_class(c)]
-
 # ─────────────────────────────────────────────────────────
-# Tailwind CSS 原子 class 检测
+# Tailwind / 原子CSS 工具类过滤
+# 规则：纯布局/尺寸/颜色/间距类，对定位无意义
 # ─────────────────────────────────────────────────────────
-# 这些单词即使是 Tailwind 内置类也保留，因为它们有足够的语义锚定价值
-_TAILWIND_BARE_EXCEPTIONS = frozenset({
-    "container", "group", "peer", "contents", "border",
-    "prose", "sr-only", "not-sr-only",
-})
-
 _TAILWIND_PATTERNS = [
-    re.compile(r'^(hover|focus|focus-within|focus-visible|active|visited|disabled'
-               r'|checked|indeterminate|placeholder|before|after|first-line|first-letter'
-               r'|marker|selection|dark|rtl|ltr'
-               r'|sm|md|lg|xl|2xl|3xl):'),           # 响应式 / 伪类 / 暗色前缀
-    re.compile(r'^(flex|grid|block|inline-block|inline-flex|inline-grid'
-               r'|inline|hidden|table|flow-root|contents)$'),  # 纯显示原语
-    re.compile(r'^(p|m|px|py|mx|my|pt|pb|pl|pr|mt|mb|ms|me|gap|space)-'),  # 间距
-    re.compile(r'^(w|h|min-w|min-h|max-w|max-h|size)-'),                    # 尺寸
-    re.compile(r'^(text|font|leading|tracking|whitespace|break|truncate'
-               r'|overflow-ellipsis|line-clamp)-'),             # 排版
-    re.compile(r'^(bg|from|to|via|gradient)-'),                 # 背景 / 渐变
-    re.compile(r'^(border|outline|ring|divide)-'),              # 边框（带修饰符）
-    re.compile(r'^(rounded|shadow|opacity|mix-blend|bg-blend)-'),  # 视觉
-    re.compile(r'^(flex|grid|col|row|order|place|items|justify|self|content)-'),  # 布局
-    re.compile(r'^(overflow|overscroll|scroll|snap)-'),         # 滚动
-    re.compile(r'^(cursor|pointer|select|resize|appearance)-'), # 交互
-    re.compile(r'^(transition|duration|ease|delay|animate)-'),  # 动画
-    re.compile(r'^(z|top|right|bottom|left|inset)-'),           # 定位
-    re.compile(r'^(static|fixed|absolute|relative|sticky)$'),  # position 原语
-    re.compile(r'^(capitalize|uppercase|lowercase|normal-case)$'),
-    re.compile(r'^(italic|not-italic|underline|line-through|no-underline)$'),
-    re.compile(r'^(visible|invisible|collapse)$'),
-    re.compile(r'^(aspect|columns|basis|grow|shrink)-'),
-    re.compile(r'^(object|origin|accent|caret|fill|stroke)-'),
-    re.compile(r'^(list|table|caption|border-collapse|border-separate)$'),
-    re.compile(r'^(float|clear)-'),
-    re.compile(r'-(xs|sm|md|lg|xl|2xl|3xl|4xl|full|screen|auto|none|px)$'),  # 常见尺寸后缀
-    re.compile(r'-\d+$'),          # 以数字结尾: p-4, mt-2, w-64 等
-    re.compile(r'-\[.+\]$'),       # 任意值: w-[200px], text-[#fff]
+    # 响应式 / 状态前缀
+    re.compile(r'^(sm|md|lg|xl|2xl|dark|light|hover|focus|focus-within|'
+               r'focus-visible|active|visited|disabled|checked|group|peer|'
+               r'first|last|odd|even|not|aria|data|print|rtl|ltr):'),
+    # 布局类型关键字（单独出现）
+    re.compile(r'^(flex|grid|block|inline|inline-block|inline-flex|inline-grid|'
+               r'hidden|invisible|visible|contents|flow-root|list-item|'
+               r'table|table-row|table-cell|relative|absolute|fixed|sticky|static)$'),
+    # flex / grid 对齐
+    re.compile(r'^(items|justify|content|self|place|justify-items|justify-self|'
+               r'place-items|place-content|place-self)[-]'),
+    # 尺寸
+    re.compile(r'^(w|h|min-w|min-h|max-w|max-h|size)[-]'),
+    # 内外边距
+    re.compile(r'^(p|m|px|py|pt|pb|pl|pr|mx|my|mt|mb|ml|mr|ps|pe|ms|me)[-]'),
+    # 间距
+    re.compile(r'^(gap|gap-x|gap-y|space-x|space-y)[-]'),
+    # 排版
+    re.compile(r'^(text|font|leading|tracking|indent|align|whitespace|'
+               r'break|hyphens|list|decoration|underline|overline|'
+               r'line-through|no-underline)[-]'),
+    re.compile(r'^(text|font|leading|tracking|align)$'),
+    # 颜色 / 背景 / 边框
+    re.compile(r'^(bg|border|ring|shadow|outline|divide|accent|caret|'
+               r'fill|stroke)[-]'),
+    re.compile(r'^(border|outline|ring|shadow|divide)$'),
+    # 圆角 / overflow / 截断
+    re.compile(r'^(rounded|overflow|truncate|overscroll|scroll)'),
+    # grid span / order
+    re.compile(r'^(col|row)[-](span|start|end|auto)'),
+    re.compile(r'^(col|row)[-]\d'),
+    re.compile(r'^(order|grow|shrink|basis|flex)[-]'),
+    re.compile(r'^(grow|shrink)$'),
+    # z-index / opacity / cursor / transition / transform
+    re.compile(r'^(z|opacity|cursor|pointer-events|select|resize|'
+               r'transition|duration|ease|delay|animate|'
+               r'scale|rotate|translate|skew|origin|'
+               r'transform|will-change)[-]'),
+    re.compile(r'^(transform|transition|animate|opacity|resize)$'),
+    # 杂项布局
+    re.compile(r'^(container|contents|aspect|object|float|clear|'
+               r'inset|top|bottom|left|right|start|end)[-]?'),
+    # 伪元素 / before / after
+    re.compile(r'^(before|after):'),
+    # 纯数字 class（bootstrap grid: col-6 等）
+    re.compile(r'^[a-z]+-\d+$'),
 ]
 
 def _is_tailwind_class(cls: str) -> bool:
-    """判断一个 class 是否是 Tailwind 原子功能类（不适合作为 XPath 锚点）。"""
-    if cls in _TAILWIND_BARE_EXCEPTIONS:
-        return False
     return any(p.search(cls) for p in _TAILWIND_PATTERNS)
 
+
 # ─────────────────────────────────────────────────────────
-# Variant class 检测（位置/状态类，不应出现在 XPath 谓词中）
+# Variant class 过滤（位置/状态类）
 # ─────────────────────────────────────────────────────────
 _VARIANT_EXACT = frozenset({
     "first", "last", "odd", "even",
@@ -121,28 +154,55 @@ _VARIANT_EXACT = frozenset({
 _VARIANT_PATTERNS = [
     re.compile(r'-(first|last|odd|even|active|current|selected)$', re.I),
     re.compile(r'^(first|last|odd|even|active)-', re.I),
-    re.compile(r'^is-'),   # is-active, is-open, etc.
+    re.compile(r'^is-'),
 ]
+
+# 通用布局工具 class（非 Tailwind 框架也会出现）
+_LAYOUT_UTILITY_CLASSES = frozenset({
+    "clearfix", "clear", "cf",
+    "container", "wrapper", "wrap", "inner", "outer",
+    "row", "col", "column",
+    "grid", "flex",
+    "block", "inline",
+    "left", "right", "center",
+    "pull-left", "pull-right", "float-left", "float-right",
+    "d-flex", "d-block", "d-none", "d-grid",   # Bootstrap 5
+})
 
 def _is_variant_class(cls: str) -> bool:
     if cls.lower() in _VARIANT_EXACT:
         return True
+    if cls.lower() in _LAYOUT_UTILITY_CLASSES:
+        return True
     return any(p.search(cls) for p in _VARIANT_PATTERNS)
+
+
+def _is_noise_class(cls: str) -> bool:
+    """综合判断一个 class 是否为噪声（对 XPath 定位无意义）。"""
+    return _is_hashed_class(cls) or _is_tailwind_class(cls) or _is_variant_class(cls)
+
+
+def _stable_classes(classes) -> list:
+    if not classes:
+        return []
+    if isinstance(classes, str):
+        classes = classes.split()
+    return [c for c in classes if not _is_noise_class(c)]
+
 
 # ─────────────────────────────────────────────────────────
 # 动态 ID 检测
 # ─────────────────────────────────────────────────────────
 _DYNAMIC_ID_PATTERNS = [
-    re.compile(r'\d{5,}'),                 # 长数字序列: id="el12345"
-    re.compile(r'^[a-z]-[a-f0-9]{6,}'),    # CSS-module 风格: id="a-3f2b1c"
-    re.compile(r'^[a-f0-9]{8,}$'),          # 纯十六进制哈希
-    re.compile(r'[-_][a-f0-9]{6,}$'),       # 尾部哈希: id="item-a3b2c1"
-    re.compile(r'^:'),                       # React/框架生成: id=":r1:"
-    re.compile(r'^(ember|react|vue|ng)-'),   # 框架前缀
+    re.compile(r'\d{5,}'),
+    re.compile(r'^[a-z]-[a-f0-9]{6,}'),
+    re.compile(r'^[a-f0-9]{8,}$'),
+    re.compile(r'[-_][a-f0-9]{6,}$'),
+    re.compile(r'^:'),
+    re.compile(r'^(ember|react|vue|ng|svelte)-'),
 ]
 
 def _is_stable_id(id_str: str) -> bool:
-    """判断 HTML id 属性是否稳定（非动态生成）。"""
     if not id_str:
         return False
     for pattern in _DYNAMIC_ID_PATTERNS:
@@ -150,13 +210,13 @@ def _is_stable_id(id_str: str) -> bool:
             return False
     return True
 
+
 # ─────────────────────────────────────────────────────────
-# ML 特征提取
+# ML 特征提取（保持不变）
 # ─────────────────────────────────────────────────────────
-_SEMANTIC_TAGS = {'h1','h2','h3','h4','h5','h6','p','a','span','li','td','button'}
-_SEMANTIC_CLASSES = ['title','description','name','price','date','link','item']
-_NUMERIC_KEYS = ['depth','sibling_count','sibling_index','child_count']
-_CAT_KEYS = ['tag', 'id_prefix', 'ancestor_0_tag']
+_NUMERIC_KEYS = ['depth', 'sibling_count', 'sibling_index', 'child_count',
+                 'text_length', 'has_href', 'has_img', 'repeated_siblings']
+_CAT_KEYS = ['tag', 'id_prefix', 'ancestor_0_tag', 'ancestor_1_tag']
 
 def _extract_node_features(node, soup) -> dict:
     f = {'tag': node.name or '', 'depth': len(list(node.parents))}
@@ -165,41 +225,67 @@ def _extract_node_features(node, soup) -> dict:
         siblings = [s for s in parent.children if hasattr(s, 'name') and s.name == node.name]
         f['sibling_count'] = len(siblings)
         f['sibling_index'] = siblings.index(node) if node in siblings else 0
+        # 同结构兄弟（tag + stable class 相同）
+        stable = tuple(sorted(_stable_classes(node.attrs.get('class', []))))
+        repeated = [s for s in siblings
+                    if tuple(sorted(_stable_classes(s.attrs.get('class', [])))) == stable]
+        f['repeated_siblings'] = len(repeated)
     else:
-        f['sibling_count'] = f['sibling_index'] = 0
+        f['sibling_count'] = f['sibling_index'] = f['repeated_siblings'] = 0
+
     f['id_prefix'] = re.sub(r'-?\d+$', '', node.attrs.get('id', ''))
     f['child_count'] = len(list(node.children))
+    # 文本特征
+    text = node.get_text(strip=True)
+    f['text_length'] = len(text)
+    # 链接/图片特征
+    f['has_href'] = int(bool(node.attrs.get('href')))
+    f['has_img'] = int(bool(node.find('img')))
     ancestors = list(node.parents)
-    f['ancestor_0_tag'] = ancestors[0].name if ancestors else ''
+    f['ancestor_0_tag'] = ancestors[0].name if len(ancestors) > 0 else ''
+    f['ancestor_1_tag'] = ancestors[1].name if len(ancestors) > 1 else ''
     return f
 
 def _features_to_vector(features: dict, vocab: dict = None):
     numeric_vec = [float(features.get(k, 0)) for k in _NUMERIC_KEYS]
     building = vocab is None
-    if building: vocab = {k: {} for k in _CAT_KEYS}
+    if building:
+        vocab = {k: {} for k in _CAT_KEYS}
     cat_vec = []
     for k in _CAT_KEYS:
         val = str(features.get(k, ''))
-        if building and val not in vocab[k]: vocab[k][val] = len(vocab[k])
+        if building and val not in vocab[k]:
+            vocab[k][val] = len(vocab[k])
         cat_vec.append(float(vocab[k].get(val, len(vocab[k]))))
     return np.array(numeric_vec + cat_vec, dtype=np.float32), vocab
 
+
 # ─────────────────────────────────────────────────────────
-# AutoScraper 类
+# AutoScraper 主类
 # ─────────────────────────────────────────────────────────
 
 class AutoScraper(object):
     request_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
     }
+
+    # XPath 锚点策略参数
+    MAX_CLASS_PREDICATES = 2    # 每个节点最多保留几个 class 谓词
+    MIN_CLASS_LENGTH = 3        # 过短的 class 名通常无意义（如 "h1" "xs"），跳过
 
     def __init__(self, stack_list=None):
         self.stack_list = stack_list or []
+        self._ml_active = False
+        self._ml_classifiers: dict = {}
+        self._xpath_overrides: dict[str, str] = {}  # 外部直接注入的 XPath 规则
 
     # ── 持久化 ──────────────────────────────────────────
 
     def save(self, file_path):
-        """保存学习结果到 JSON 文件（stacks + XPath 规则）。"""
         data = {
             "stack_list": self.stack_list,
             "xpath_rules": self.get_result_xpath_rule(),
@@ -208,7 +294,6 @@ class AutoScraper(object):
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def load(self, file_path):
-        """从 JSON 文件加载学习结果。"""
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
@@ -229,32 +314,54 @@ class AutoScraper(object):
 
     @staticmethod
     def _get_valid_attrs(item):
-        key_attrs = {"class", "id"}
-        attrs = {k: v for k, v in item.attrs.items() if k in key_attrs}
-        if "class" in attrs and isinstance(attrs["class"], list):
-            attrs["class"] = _stable_classes(attrs["class"])
+        """
+        采集节点属性，优先级：
+          1. data-* 锚点属性（ANCHOR_ATTRS_PRIORITY 中的 data-/aria-/role）
+          2. id
+          3. class（只保留 stable classes）
+
+        注意：只采集 ANCHOR_ATTRS_PRIORITY 中明确列出的 data-* 属性，
+        避免采集动态注入的 data-v-xxxx / data-reactid 等框架内部属性。
+        """
+        attrs = {}
+
+        # 采集锚点属性
+        for anchor in ANCHOR_ATTRS_PRIORITY:
+            val = item.attrs.get(anchor)
+            if val:
+                # role 只保留语义 role
+                if anchor == "role":
+                    if isinstance(val, list):
+                        val = val[0]
+                    if val not in _SEMANTIC_ROLES:
+                        continue
+                if isinstance(val, list):
+                    val = val[0]
+                attrs[anchor] = val.strip()
+
+        # id
+        id_val = item.attrs.get("id", "")
+        if isinstance(id_val, list):
+            id_val = id_val[0]
+        if id_val:
+            attrs["id"] = id_val.strip()
+
+        # class（只保留 stable classes）
+        raw_classes = item.attrs.get("class", [])
+        stable = _stable_classes(raw_classes)
+        if stable:
+            attrs["class"] = stable
+
         return attrs
 
     def build(self, url=None, wanted_list=None, wanted_dict=None, html=None,
               request_args=None, update=False, text_fuzz_ratio=1.0, use_ml=True):
-        """在训练页面上根据样本数据学习 DOM 路径，反推 XPath 规则。
-
-        流程：
-        1. 规则模式：精确文本/属性匹配 → 构建 stack
-        2. ML fallback（use_ml=True 且 sklearn 可用）：规则模式为空时，
-           用随机森林分类器定位目标节点 → 构建 stack
-        3. 所有 stack 统一经 _stack_to_xpath 转为 XPath 规则
-
-        Returns:
-            dict | None: {alias: xpath_string} 或 None（无匹配）
-        """
         soup = self._get_soup(url=url, html=html, request_args=request_args)
         if not update:
             self.stack_list = []
 
         _wdict = wanted_dict or {"default": wanted_list or []}
 
-        # Step 1: 规则模式 — 精确文本/属性匹配
         for alias, targets in _wdict.items():
             for target in targets:
                 target = normalize(target)
@@ -266,13 +373,13 @@ class AutoScraper(object):
 
         self.stack_list = unique_stack_list(self.stack_list)
 
-        # Step 2: ML fallback — 规则模式未找到结果时启用
         if not self.stack_list and use_ml and _ML_AVAILABLE:
             logger.info("规则模式未找到结果，切换到 ML 模式...")
+            self._ml_active = True
+            self._ml_wanted_dict = _wdict
             self._ml_build_stacks(soup, url, _wdict, text_fuzz_ratio)
             self.stack_list = unique_stack_list(self.stack_list)
 
-        # 统一返回 XPath 规则
         rules = self.get_result_xpath_rule()
         if rules:
             for alias, xpath in rules.items():
@@ -280,32 +387,20 @@ class AutoScraper(object):
         return rules
 
     def _child_matches(self, child, text, url, fuzz):
-        """检查 child 是否匹配目标文本。
-
-        匹配顺序：
-        1. 完整文本（getText）
-        2. 直接文本（不含子节点递归文本）
-        3. 属性值精确匹配
-        4. href/src 属性的完整 URL 匹配（urljoin 拼接后比对）
-        """
-        # 1) 完整文本
         child_text = normalize(child.get_text(strip=True))
         if text_match(text, child_text, fuzz):
-            # 去重：如果父节点文本完全相同，跳过（保留最内层）
             parent_text = normalize(child.parent.get_text(strip=True)) if child.parent else ""
             if child_text == parent_text and child.parent and child.parent.parent:
                 return False
             child.wanted_attr = None
             return True
 
-        # 2) 直接文本（不含子节点）
         non_rec = normalize(get_non_rec_text(child))
         if non_rec and text_match(text, non_rec, fuzz):
             child.wanted_attr = None
             child.is_non_rec_text = True
             return True
 
-        # 3) 属性值匹配 + URL 匹配
         for k, v in child.attrs.items():
             if not isinstance(v, str):
                 continue
@@ -313,10 +408,14 @@ class AutoScraper(object):
             if text_match(text, v, fuzz):
                 child.wanted_attr = k
                 return True
-            # URL 宽松匹配：完整 URL 样本 vs 相对路径属性值
-            if k in ("href", "src") and url:
-                full_url = urljoin(url, v)
-                if text_match(text, full_url, fuzz):
+            if k in ("href", "src"):
+                if url:
+                    full_url = urljoin(url, v)
+                    if text_match(text, full_url, fuzz):
+                        child.wanted_attr = k
+                        return True
+                parsed = urlparse(v)
+                if parsed.scheme and text.startswith("/") and parsed.path == text:
                     child.wanted_attr = k
                     return True
         return False
@@ -327,31 +426,26 @@ class AutoScraper(object):
         parent = child
         while True:
             gp = parent.find_parent()
-            if not gp or gp.name == "[document]": break
-            # 构造搜索属性，移除空 class 避免 BeautifulSoup 匹配异常
-            # （空列表会匹配"没有 class 的元素"而非"所有同 tag 元素"）
+            if not gp or gp.name == "[document]":
+                break
             search_attrs = cls._get_valid_attrs(parent)
+            # 移除空 class 避免 BS4 匹配异常
             if "class" in search_attrs and not search_attrs["class"]:
                 search_attrs.pop("class")
-            siblings = gp.find_all(parent.name, search_attrs, recursive=False)
-            # tag-only 兄弟计数（更宽松，反映真实重复度）
+            # BS4 只能用 id/class 做 find_all 过滤，data-*/aria-* 需要手动处理
+            bs4_attrs = {k: v for k, v in search_attrs.items() if k in ("id", "class")}
+            siblings = gp.find_all(parent.name, bs4_attrs, recursive=False)
             tag_only_siblings = gp.find_all(parent.name, recursive=False)
             tag_only_count = len(tag_only_siblings)
             for i, c in enumerate(siblings):
                 if c == parent:
-                    # 5-tuple: (tag, attrs, child_index, child_sibling_count, tag_only_count)
-                    # child_index: content[k+1] 在同类兄弟中的位置
-                    # child_sibling_count: class-filtered 同类兄弟总数
-                    # tag_only_count: 仅按 tag 搜索的兄弟总数（用于判断是否为重复元素）
                     content.insert(0, (gp.name, cls._get_valid_attrs(gp), i, len(siblings), tag_only_count))
                     break
             else:
-                # 未在过滤后的兄弟中找到自身，记录为无索引层级（避免丢层）
                 content.insert(0, (gp.name, cls._get_valid_attrs(gp)))
             parent = gp
 
         wanted_attr = getattr(child, "wanted_attr", None)
-        # hash 必须包含 wanted_attr，否则同路径不同提取目标的 stack 会被去重
         hash_input = str((content, wanted_attr)).encode()
         stack = {
             "content": content,
@@ -361,65 +455,42 @@ class AutoScraper(object):
         }
         return stack
 
-    # ── ML 辅助：节点签名 + 兄弟扩展 + ML → stack 桥接 ──
+    # ── ML 辅助 ──────────────────────────────────────────
 
     @staticmethod
     def _node_signature(node) -> str:
-        """节点结构签名：tag + 稳定 class + 父 tag，用于判断同类兄弟。"""
         stable = tuple(sorted(_stable_classes(node.attrs.get('class', []))))
         parent_tag = node.parent.name if node.parent else ''
         return f"{node.name}|{stable}|{parent_tag}"
 
     def _expand_to_siblings(self, seed_nodes, all_nodes) -> set:
-        """从种子节点出发，找出所有结构相同的兄弟节点索引。
-
-        两层策略：
-        1. 严格模式：同一父节点下 tag+稳定class 相同（直接兄弟）
-        2. 宽松模式：全页面 tag+稳定class+父tag 相同（列表项重复模式）
-           额外要求：祖父节点签名也相同，防止误匹配导航栏等无关区域
-        """
         expanded = set()
         for seed in seed_nodes:
             sig = self._node_signature(seed)
             parent = seed.parent
             if parent is None:
                 continue
-
-            # 策略1：同一父节点下的直接兄弟
             same_parent = {
                 i for i, node in enumerate(all_nodes)
                 if node.parent is parent and self._node_signature(node) == sig
             }
-
             if len(same_parent) > 1:
                 expanded |= same_parent
             else:
-                # 策略2：列表模式——父节点本身可重复（如 <li>）
                 parent_sig = self._node_signature(parent)
                 for i, node in enumerate(all_nodes):
                     if (self._node_signature(node) == sig
                             and node.parent is not None
                             and self._node_signature(node.parent) == parent_sig):
                         expanded.add(i)
-
         return expanded
 
     def _ml_build_stacks(self, soup, url, wanted_dict, fuzz_ratio):
-        """ML 模式：用随机森林定位目标节点，然后构建 stack 反推 XPath。
-
-        流程：
-        1. 文本/属性匹配找到种子节点
-        2. _expand_to_siblings 扩展到全部同结构节点
-        3. 随机森林训练，找出概率最高的代表节点
-        4. 从代表节点构建 stack（后续由 _stack_to_xpath 转为 XPath）
-        """
         all_nodes = [n for n in soup.find_all(True) if n.name]
         all_features = [_extract_node_features(n, soup) for n in all_nodes]
 
         for alias, targets in wanted_dict.items():
             targets = [normalize(t) for t in targets]
-
-            # ── 找种子节点 ──
             seed_nodes = []
             for target in targets:
                 target_path = urlparse(target).path if target.startswith("http") else (
@@ -427,10 +498,8 @@ class AutoScraper(object):
                 )
                 for node in all_nodes:
                     hit = False
-                    # 文本匹配（复用 text_match，与 _child_matches 一致）
                     text = normalize(node.get_text(strip=True))
                     hit = text_match(target, text, fuzz_ratio)
-                    # 属性匹配
                     if not hit:
                         for val in node.attrs.values():
                             if not isinstance(val, str):
@@ -443,7 +512,6 @@ class AutoScraper(object):
                                 hit = True
                                 break
                     if hit:
-                        # 只保留最内层节点（排除祖先）
                         is_ancestor = any(node in list(sn.parents) for sn in seed_nodes)
                         if not is_ancestor:
                             seed_nodes.append(node)
@@ -452,18 +520,11 @@ class AutoScraper(object):
                 logger.warning("alias='%s' ML 模式未找到种子节点，跳过", alias)
                 continue
 
-            # ── 扩展到同结构兄弟 ──
             positive_indices = self._expand_to_siblings(seed_nodes, all_nodes)
             for sn in seed_nodes:
                 if sn in all_nodes:
                     positive_indices.add(all_nodes.index(sn))
 
-            logger.info(
-                "alias='%s' ML 训练：%d 种子 → %d 正样本 / %d 总节点",
-                alias, len(seed_nodes), len(positive_indices), len(all_nodes),
-            )
-
-            # ── 训练随机森林 ──
             vocab = None
             vecs = []
             for feat in all_features:
@@ -478,13 +539,11 @@ class AutoScraper(object):
             )
             clf.fit(X, y)
 
-            # ── 预测：找概率最高的代表节点 → 构建 stack ──
             proba = clf.predict_proba(X)
             pos_idx = list(clf.classes_).index(1) if 1 in clf.classes_ else 1
             best_i = int(np.argmax(proba[:, pos_idx]))
             representative = all_nodes[best_i]
 
-            # 判断字段类型：如果样本是 URL，wanted_attr 设为 href
             is_url_field = any(t.startswith("http") or t.startswith("/") for t in targets)
             if is_url_field and representative.get("href"):
                 representative.wanted_attr = "href"
@@ -494,41 +553,44 @@ class AutoScraper(object):
             stack = self._build_stack(representative, url)
             stack["alias"] = alias
             self.stack_list.append(stack)
-
-            xpath = self._stack_to_xpath(stack)
-            logger.info(
-                "alias='%s' ML → XPath: %s  (代表节点: <%s> prob=%.3f)",
-                alias, xpath, representative.name, proba[best_i][pos_idx],
-            )
+            self._ml_classifiers[alias] = (clf, vocab)
 
     def build_xpath(self, url=None, wanted_dict=None, html=None, **kwargs):
         self.build(url=url, wanted_dict=wanted_dict, html=html, **kwargs)
         return self.get_result_xpath_rule()
 
     def get_result_xpath_rule(self, url=None):
-        if not self.stack_list: return {}
+        if not self.stack_list and not self._xpath_overrides:
+            return {}
         rules = {}
         for stack in self.stack_list:
             alias = stack.get("alias", "default")
             if alias not in rules:
                 rules[alias] = self._stack_to_xpath(stack)
+        rules.update(self._xpath_overrides)
         return rules
 
+    # ─────────────────────────────────────────────────────────
+    # _stack_to_xpath：XPath 锚点策略核心
+    # ─────────────────────────────────────────────────────────
     def _stack_to_xpath(self, stack):
-        """将学习到的 stack 转换为精准 XPath 表达式。
+        """
+        将 stack 转换为 XPath，采用锚点优先策略：
 
-        策略：
-        - ID 锚点：遇到稳定 ID 时重置路径，且不再加 class（ID 已足够唯一）
-        - class 匹配：过滤 variant class（first/odd/active 等位置/状态类）后使用词边界匹配
-        - 位置谓词：用 tag-only 兄弟计数判断 is_repeating，避免 class-filtered count 偏低
-        - 路径类型：起始用 //，后续用 / 表示直接父子关系
+        锚点优先级（遇到即重置路径，从 // 重新出发）：
+          1. data-testid / data-cy / data-test / data-id / data-key /
+             data-type / data-name / data-target / data-component / data-section
+          2. aria-label / aria-labelledby
+          3. role（仅语义 role）
+          4. 稳定 ID（非动态生成）
+          5. 语义 class（过滤 Tailwind/工具类后剩余的，最多 MAX_CLASS_PREDICATES 个）
+          6. 结构位置（最后的兜底）
 
-        数据结构说明：
-        content[k] 可能是：
-          2-tuple (tag, attrs) — 叶子节点或无索引的层级
-          4-tuple (tag, attrs, child_index, child_sibling_count) — 旧格式中间层级
-          5-tuple (tag, attrs, child_index, child_sibling_count, tag_only_count) — 新格式
-        其中 child_index/child_sibling_count 描述 content[k+1] 在同类兄弟中的位置/总数
+        各层谓词构造规则：
+          - 有锚点/ID：直接用等值匹配（@attr='val'），不叠加 class
+          - 仅有 class：uses contains(concat()) 词边界匹配，最多 MAX_CLASS_PREDICATES 个
+          - 无任何有效属性：只用 tag，必要时加位置谓词 [n]
+          - is_repeating（列表场景）：不加位置谓词，让 XPath 匹配所有兄弟
         """
         content = stack.get("content", [])
         if not content:
@@ -544,10 +606,10 @@ class AutoScraper(object):
             if tag in ("html", "body", "[document]"):
                 continue
 
-            # ── 读取兄弟索引数据（存储在上一个 content 条目）──
+            # ── 读取兄弟索引（存在上一个 content 条目里）──
             sibling_idx = None
-            sibling_count = None       # class-filtered count
-            tag_only_count = None      # tag-only count（新增）
+            sibling_count = None
+            tag_only_count = None
             if i > 0:
                 prev = content[i - 1]
                 if len(prev) >= 4:
@@ -556,49 +618,66 @@ class AutoScraper(object):
                 if len(prev) >= 5:
                     tag_only_count = prev[4]
                 else:
-                    tag_only_count = sibling_count  # 向后兼容
+                    tag_only_count = sibling_count
 
+            is_leaf = (i == last_idx)
+            is_repeating = tag_only_count is not None and tag_only_count > 1
+
+            # ════════════════════════════════════════════
+            # 锚点检测：按优先级找第一个有效锚点
+            # ════════════════════════════════════════════
+            anchor_pred = self._find_anchor_predicate(attrs)
+
+            if anchor_pred:
+                # 找到锚点 → 重置路径（全局锚点，用 // 出发）
+                xpath_parts = []
+                xpath_parts.append(f"{tag}[{anchor_pred}]")
+                continue  # 锚点节点不加位置谓词，也不加 class
+
+            # ════════════════════════════════════════════
+            # 无锚点：按优先级构造谓词
+            # ════════════════════════════════════════════
             attr_predicates = []
             has_id = False
 
-            # ── ID 谓词 ──
+            # ── 稳定 ID ──
             node_id = attrs.get("id", "")
             if node_id and _is_stable_id(node_id):
                 attr_predicates.append(f"@id='{node_id}'")
                 has_id = True
                 xpath_parts = []  # ID 全局唯一，重置路径
-                # 有 ID 时不再加 class（ID 已足够唯一）
 
-            # ── class 谓词（仅无 ID 时）──
+            # ── 语义 class（仅无 ID 时，且过滤后有剩余）──
             if not has_id:
                 classes = attrs.get("class", [])
                 if isinstance(classes, str):
                     classes = classes.split()
-                # 过滤 variant class（first/odd/active 等位置/状态类）
-                classes = [c for c in classes if not _is_variant_class(c)]
-
-                # 分离稳定 class 和 Tailwind 原子 class
-                stable = [c for c in classes if not _is_tailwind_class(c)]
-
-                if stable:
-                    # 有稳定 class → 用作锚点，重置路径（丢弃前面所有 Tailwind 父节点）
-                    xpath_parts = []
-                    for cls in stable:
-                        attr_predicates.append(
-                            f"contains(concat(' ',@class,' '),' {cls} ')"
-                        )
-                # 全是 Tailwind class → 不加 class 谓词，只保留 tag（靠位置谓词区分）
+                # 再次过滤（_get_valid_attrs 已经过滤一次，这里双重保险）
+                classes = [c for c in classes if not _is_noise_class(c)]
+                # 过滤过短的 class 名（通常是缩写工具类）
+                classes = [c for c in classes if len(c) >= self.MIN_CLASS_LENGTH]
+                # 按"越具体越好"排序：优先保留含连字符或大写的语义名
+                classes = sorted(classes, key=lambda c: (
+                    -int(bool(re.search(r'[A-Z]|-', c))),  # 有大写/连字符优先
+                    len(c),                                  # 较短的排前面（通常更具体）
+                ))
+                # 最多保留 MAX_CLASS_PREDICATES 个
+                classes = classes[:self.MAX_CLASS_PREDICATES]
+                for cls in classes:
+                    attr_predicates.append(
+                        f"contains(concat(' ',@class,' '),' {cls} ')"
+                    )
 
             # ── 构造节点段 ──
             part = tag
             if attr_predicates:
                 part += "[" + " and ".join(attr_predicates) + "]"
 
-            # ── 位置谓词 ──
-            # 用 tag_only_count 判断是否为重复元素（比 class-filtered count 更准确）
-            is_leaf = (i == last_idx)
-            is_repeating = tag_only_count is not None and tag_only_count > 1
-            if sibling_idx is not None and not has_id and not is_leaf and not is_repeating:
+            # ── 位置谓词（列表场景不加，避免只匹配第一行）──
+            if (sibling_idx is not None
+                    and not has_id
+                    and not is_leaf
+                    and not is_repeating):
                 part += f"[{sibling_idx + 1}]"
 
             xpath_parts.append(part)
@@ -614,29 +693,43 @@ class AutoScraper(object):
 
         return xpath
 
+    def _find_anchor_predicate(self, attrs: dict) -> str | None:
+        """
+        按 ANCHOR_ATTRS_PRIORITY 顺序扫描 attrs，返回第一个有效锚点的谓词字符串。
+
+        返回格式示例：
+          "@data-testid='file-row'"
+          "@aria-label='file navigation'"
+          "@role='navigation'"
+
+        无有效锚点时返回 None。
+        """
+        for anchor in ANCHOR_ATTRS_PRIORITY:
+            val = attrs.get(anchor)
+            if not val:
+                continue
+            if isinstance(val, list):
+                val = val[0]
+            val = val.strip()
+            if not val:
+                continue
+            # role 只接受语义 role
+            if anchor == "role" and val not in _SEMANTIC_ROLES:
+                continue
+            # aria-label / data-* 值不能太短（避免 "a" "1" 这类噪声）
+            if len(val) < 2:
+                continue
+            return f"@{anchor}='{val}'"
+        return None
+
     def get_result_similar(self, url=None, html=None, soup=None,
                            group_by_alias=False, unique=True, **kwargs):
-        """用已学习的 XPath 规则在页面上提取数据。
-
-        Args:
-            url: 目标页面 URL
-            html: 目标页面 HTML 字符串
-            soup: 已解析的 BeautifulSoup 对象（会转为 lxml tree）
-            group_by_alias: True 返回 {alias: [values]}，False 返回扁平列表
-            unique: 是否去重（默认 True）
-
-        Returns:
-            dict | list: 提取结果
-        """
         from lxml import html as lxml_html
 
         rules = self.get_result_xpath_rule()
         if not rules:
             return {} if group_by_alias else []
 
-        # 与 build()/_get_soup() 保持一致的解析链:
-        # normalize + unescape → BS4(lxml) → str → lxml_html
-        # 避免 BS4 与 lxml 直接解析同一 HTML 产出不同 DOM 树导致 XPath 匹配失败
         if html:
             soup_obj = self._get_soup(html=html)
             tree = lxml_html.fromstring(str(soup_obj))

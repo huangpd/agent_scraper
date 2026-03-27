@@ -1,9 +1,4 @@
-"""主编排器: 组装 Tools → 构建 Reasoner → 运行 ReAct 循环
-
-对外 API 不变:
-    scraper = AgentScraper(headless=False, on_event=callback)
-    result  = await scraper.run(instruction, images=[...])
-"""
+"""主编排器: 组装 Tools → 构建 Reasoner → 运行 ReAct 循环"""
 
 import logging
 from typing import Any, Callable
@@ -17,6 +12,8 @@ from agent_scraper.pipeline.context import AgentContext
 from agent_scraper.pipeline.evaluator import Evaluator
 from agent_scraper.pipeline.reasoner import Reasoner
 from agent_scraper.pipeline.task_parser import TaskParser
+from agent_scraper.core.llm import LLMService
+from agent_scraper.core.trace import trace_scope, get_llm_count
 from agent_scraper.pipeline.tools import (
     CaptureNavigateTool,
     DiscoverRulesTool,
@@ -25,6 +22,7 @@ from agent_scraper.pipeline.tools import (
     IteratePagesTool,
     NavigateTool,
     ToolRegistry,
+    VisionSampleTool,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,28 +36,28 @@ class AgentScraper:
     ):
         self.on_event = on_event or (lambda *a: None)
 
-        from agent_scraper.core.llm import create_openai_client, get_model_name
-        client = create_openai_client()
-        model = get_model_name()
+        # ── 1. 初始化统一 LLM 服务 (AOP 层) ──
+        self.llm_service = LLMService()
 
-        # ── 1. 底层组件（不改动）──
-        self.task_parser = TaskParser(client=client)
+        # ── 2. 底层组件 (注入 llm_service) ──
+        self.task_parser = TaskParser(llm_service=self.llm_service)
         navigator = Navigator(headless=headless)
-        rule_discoverer = RuleDiscoverer(client=client)
-        extractor = Extractor(client=client)
+        rule_discoverer = RuleDiscoverer(llm_service=self.llm_service)
+        extractor = Extractor(llm_service=self.llm_service)
         formatter = Formatter()
 
-        # ── 2. 注册 Tools ──
+        # ── 3. 注册 Tools ──
         self.registry = ToolRegistry()
         self.registry.register(NavigateTool(navigator))
         self.registry.register(CaptureNavigateTool(navigator))
         self.registry.register(DiscoverRulesTool(rule_discoverer))
         self.registry.register(IteratePagesTool(extractor))
         self.registry.register(ExtractTool(extractor))
+        self.registry.register(VisionSampleTool(self.llm_service))
         self.registry.register(FormatTool(formatter))
 
-        # ── 3. 评估器 + 推理器 ──
-        evaluator = Evaluator(client=client, model=model)
+        # ── 4. 评估器 + 推理器 ──
+        evaluator = Evaluator(llm_service=self.llm_service)
         self.reasoner = Reasoner(
             tools=self.registry,
             evaluator=evaluator,
@@ -69,42 +67,45 @@ class AgentScraper:
     async def run(
         self, instruction: str, images: list[str] | None = None,
     ) -> ScrapedResult:
-        ctx: AgentContext | None = None
-        try:
-            # 1. 解析自然语言 → 结构化任务
-            logger.info("[AgentScraper] 解析指令...")
-            task = await self.task_parser.parse(instruction)
+        # ── 开启追踪作用域：本次任务的所有日志都会带上同一个 ID ──
+        with trace_scope() as tid:
+            ctx: AgentContext | None = None
+            try:
+                # 1. 解析自然语言 → 结构化任务
+                logger.info("[AgentScraper][#%s] 开始新任务解析...", tid)
+                task = await self.task_parser.parse(instruction)
 
-            fields = list(task.extraction_goal.fields.keys())
-            logger.info("  模式: %s", task.mode)
-            logger.info("  导航步骤: %d 步", len(task.navigation_steps))
-            logger.info("  提取字段: %s", fields)
-            if task.extraction_goal.samples:
-                sample_count = len(next(iter(task.extraction_goal.samples.values())))
-                logger.info("  用户样本: %d 条", sample_count)
-            else:
-                logger.info("  用户样本: 无（建议提供 JSON 样本以提高准确率）")
-            if task.extraction_goal.traversal_hints:
-                logger.info("  遍历模式: %s", task.extraction_goal.traversal_hints)
-            else:
-                logger.info("  遍历模式: 单页（无遍历）")
+                fields = list(task.extraction_goal.fields.keys())
+                logger.info("  模式: %s", task.mode)
+                logger.info("  导航步骤: %d 步", len(task.navigation_steps))
+                logger.info("  提取字段: %s", fields)
 
-            # 2. 构建共享上下文
-            ctx = AgentContext(
-                task=task,
-                images=images or [],
-                on_event=self.on_event,
-            )
+                # 2. 构建共享上下文
+                ctx = AgentContext(
+                    task=task,
+                    images=images or [],
+                    on_event=self.on_event,
+                )
 
-            # 3. ReAct 循环
-            return await self.reasoner.run(ctx)
+                # 3. ReAct 循环
+                result = await self.reasoner.run(ctx)
 
-        except Exception as e:
-            self.on_event("error", {"message": str(e)})
-            raise
-        finally:
-            if ctx and ctx.browser:
-                try:
-                    await ctx.browser.stop()
-                except Exception:
-                    pass
+                # 4. 打印统计信息
+                total_calls = get_llm_count()
+                logger.info("\n" + "="*50)
+                logger.info(f"[#{tid}] 任务完成！")
+                logger.info(f"总计 LLM 调用次数: {total_calls}")
+                logger.info("="*50 + "\n")
+
+                return result
+            except Exception as e:
+                total_calls = get_llm_count()
+                logger.error(f"[#%s] 任务执行失败 (已调用 LLM %d 次): %s", tid, total_calls, str(e), exc_info=True)
+                self.on_event("error", {"message": str(e)})
+                raise
+            finally:
+                if ctx and ctx.browser:
+                    try:
+                        await ctx.browser.stop()
+                    except Exception:
+                        pass

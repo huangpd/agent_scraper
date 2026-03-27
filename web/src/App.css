@@ -172,6 +172,74 @@ body {
   font-size: 13px;
 }
 
+/* Anomaly bubble */
+.bubble-anomaly {
+  background: #fffbeb;
+  border: 1px solid #f59e0b;
+  border-radius: 8px;
+  max-width: 90%;
+}
+
+.anomaly-header {
+  font-weight: 600;
+  color: #b45309;
+  margin-bottom: 8px;
+}
+
+.anomaly-group {
+  margin-bottom: 10px;
+}
+
+.anomaly-group:last-child {
+  margin-bottom: 0;
+}
+
+.anomaly-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.anomaly-tag {
+  flex-shrink: 0;
+  background: #fef3c7;
+  color: #92400e;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.anomaly-count {
+  font-size: 12px;
+  color: #92400e;
+}
+
+.anomaly-items {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-left: 12px;
+  border-left: 2px solid #fde68a;
+}
+
+.anomaly-item {
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.anomaly-entry {
+  color: #6b7280;
+  word-break: break-all;
+}
+
+.anomaly-reason {
+  color: #d97706;
+  font-size: 12px;
+  margin-left: 4px;
+}
+
 /* Result bubble */
 .bubble-result {
   background: #fff;

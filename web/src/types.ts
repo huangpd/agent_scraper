@@ -1,4 +1,4 @@
-export type MessageType = 'user' | 'system' | 'result' | 'error' | 'step' | 'progress'
+export type MessageType = 'user' | 'system' | 'result' | 'error' | 'step' | 'progress' | 'anomaly'
 
 export interface ChatMessage {
   id: string

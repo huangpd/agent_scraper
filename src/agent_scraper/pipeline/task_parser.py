@@ -2,90 +2,27 @@
 
 import json
 import re
+import logging
 from collections import defaultdict
 
-from openai import AsyncOpenAI
-
-from agent_scraper.core.llm import create_openai_client, get_model_name
-
+from agent_scraper.core.llm import LLMService
 from agent_scraper.core.models import ExtractionGoal, NavigationStep, ParsedTask
+from agent_scraper.pipeline.prompts import PARSE_PROMPT
 
-PARSE_PROMPT = """\
-你是一个任务解析器。将用户的自然语言爬取指令解析为结构化JSON。
-
-输出格式（严格JSON，不要多余文字）：
-{{
-  "mode": "extract|capture",
-  "navigation_steps": [
-    {{"action": "goto|click|wait|input", "target": "URL或按钮文本或选择器", "value": "input时填入的值，其他为空字符串", "description": "原始描述"}}
-  ],
-  "extraction_goal": {{
-    "fields": {{"字段名": "字段描述", ...}},
-    "output_format": "json|csv",
-    "url_pattern": "可选的URL构造模板，用{{字段名}}作为占位符，没有则为null",
-    "traversal_hints": ["用户要求的遍历模式列表"],
-    "max_pages": null
-  }}
-}}
-
-mode 说明（二选一）：
-- "extract": 从页面HTML中**批量提取**结构化数据（列表、表格等多条记录）。适用于：文件列表、商品列表、搜索结果等
-- "capture": 通过浏览器操作**直接捕获**少量特定值（1-3个），不需要HTML解析。适用于：获取下载链接、复制当前URL、抓取某个特定元素的值等
-  - 当用户说"复制URL"、"获取链接"、"保存/记录某个值"、"capture"等，使用 capture
-  - 当任务核心是浏览器操作（登录→点击→获取结果），且不需要批量提取时，使用 capture
-
-navigation_steps 的 action 只包含需要AI理解的操作:
-- goto: 打开URL
-- click: 点击某个元素
-- wait: 等待页面加载
-- input: 在输入框中填写内容（target 为输入框描述，value 为要填入的值）
-
-对于登录/表单场景，将每次输入和点击拆分为独立步骤，例如：
-  {{"action": "input", "target": "邮箱输入框", "value": "user@example.com", "description": "输入邮箱"}}
-  {{"action": "input", "target": "密码输入框", "value": "mypassword", "description": "输入密码"}}
-  {{"action": "click", "target": "Sign in", "description": "点击登录"}}
-
-traversal_hints 从用户指令中识别遍历意图（数组，可多选）:
-- "load_more": 用户提到"加载更多"、"Load more"、"全部加载"等
-- "sub_pages": 用户提到"进入每个文件夹"、"遍历子页面"、"逐个点击"等
-- "pagination": 用户提到"翻页"、"所有页"、"每一页"等
-- "next_button": 用户提到"下一页"等
-- 如果用户没有提到任何遍历需求，返回空数组 []
-
-max_pages: 用户指定的最大页数限制（整数），没有则为 null：
-- "翻到第3页停止" → 3
-- "只取前5页" → 5
-- "翻页，最多10页" → 10
-- 没有提到页数限制 → null
-
-分析规则：
-1. navigation_steps 只包含到达目标页面的步骤（打开URL、点击标签等）
-2. "加载更多"、"翻页"、"进入文件夹"这些不算导航步骤，归入 traversal_hints
-3. 识别提取目标字段
-4. 忽略"样本数据"/"示例"部分
-5. 默认 output_format 为 json
-
-用户指令：
-{instruction}
-"""
-
+logger = logging.getLogger(__name__)
 
 class TaskParser:
-    def __init__(self, client: AsyncOpenAI | None = None):
-        self.client = client or create_openai_client()
-        self.model = get_model_name()
+    def __init__(self, llm_service: LLMService | None = None):
+        self.llm_service = llm_service or LLMService()
 
     async def parse(self, instruction: str) -> ParsedTask:
         # 先提取用户提供的样本数据
         samples = self._extract_samples(instruction)
 
         prompt = PARSE_PROMPT.format(instruction=instruction)
-        resp = await self.client.chat.completions.create(
-            model=self.model,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        content = resp.choices[0].message.content.strip()
+        
+        # 这里的 call 已经自动包含了 Logging 和 Trace ID
+        content = await self.llm_service.call(prompt, caller="TaskParser")
 
         if "```" in content:
             content = content.split("```")[1]
@@ -94,20 +31,24 @@ class TaskParser:
             content = content.strip()
 
         data = json.loads(content)
-
-        steps = [NavigationStep(**s) for s in data["navigation_steps"]]
+        
+        raw_steps = [NavigationStep(**s) for s in data["navigation_steps"]]
         goal_data = data["extraction_goal"]
-        # LLM 识别遍历模式 + 关键词兜底（防止 LLM 遗漏）
-        hints = goal_data.get("traversal_hints", [])
-        hints = self._ensure_traversal_hints(hints, instruction)
 
-        # LLM 识别模式 + 关键词兜底
-        mode = data.get("mode", "extract")
-        mode = self._ensure_mode(mode, instruction)
-
-        # LLM 识别页数限制 + 正则兜底
-        max_pages = goal_data.get("max_pages")
-        max_pages = self._ensure_max_pages(max_pages, instruction)
+        hints = self._ensure_traversal_hints(goal_data.get("traversal_hints", []), instruction)
+        # LLM 有时会把 load_more / 翻页类操作误放进 navigation_steps，
+        # 这些应该由 PageIterator 处理，不能让 browser-use 先点掉
+        steps, hints, load_more_text, next_button_text = self._strip_traversal_from_steps(raw_steps, hints)
+        # 兜底：从用户原始指令的引号中提取按钮文本
+        if not load_more_text and "load_more" in hints:
+            load_more_text = self._extract_quoted_text(instruction)
+        # next_button_text: LLM 解析 > strip 提取 > 指令引号提取
+        if not next_button_text:
+            next_button_text = goal_data.get("next_button_text")
+        if not next_button_text and "next_button" in hints:
+            next_button_text = self._extract_next_button_text(instruction)
+        mode = self._ensure_mode(data.get("mode", "extract"), instruction)
+        max_pages = self._ensure_max_pages(goal_data.get("max_pages"), instruction)
 
         goal = ExtractionGoal(
             fields=goal_data["fields"],
@@ -116,6 +57,8 @@ class TaskParser:
             samples=samples if samples else None,
             traversal_hints=hints,
             max_pages=max_pages,
+            load_more_text=load_more_text,
+            next_button_text=next_button_text,
         )
 
         return ParsedTask(
@@ -126,8 +69,65 @@ class TaskParser:
         )
 
     @staticmethod
+    def _strip_traversal_from_steps(
+        steps: list[NavigationStep], hints: list[str],
+    ) -> tuple[list[NavigationStep], list[str], str | None, str | None]:
+        """把 LLM 误放进 navigation_steps 的遍历操作剔除，转入 traversal_hints。
+
+        返回 (clean_steps, hints, load_more_text, next_button_text)。
+        """
+        _LOAD_MORE = re.compile(r"load\s*more|加载更多|show\s*more|全部加载", re.I)
+        _NEXT_PAGE = re.compile(r"下一页|下一頁|next\s*page", re.I)
+        _SCROLL_LOAD = re.compile(r"下滑.*加载|滚动.*加载|scroll.*load", re.I)
+
+        clean_steps: list[NavigationStep] = []
+        load_more_text: str | None = None
+        next_button_text: str | None = None
+        for step in steps:
+            combined = f"{step.target} {step.description}"
+            if step.action in ("click", "scroll"):
+                target = step.target.strip()
+                if _LOAD_MORE.search(combined) or _SCROLL_LOAD.search(combined):
+                    if "load_more" not in hints:
+                        hints.append("load_more")
+                    if target and (_LOAD_MORE.search(target) or _SCROLL_LOAD.search(target)):
+                        load_more_text = target
+                    logger.info("剔除导航步骤 → traversal_hints[load_more]: %s", step.description)
+                    continue
+                if _NEXT_PAGE.search(combined):
+                    if "next_button" not in hints:
+                        hints.append("next_button")
+                    if target and _NEXT_PAGE.search(target):
+                        next_button_text = target
+                    logger.info("剔除导航步骤 → traversal_hints[next_button]: %s", step.description)
+                    continue
+            clean_steps.append(step)
+        return clean_steps, hints, load_more_text, next_button_text
+
+    @staticmethod
+    def _extract_quoted_text(instruction: str) -> str | None:
+        """从指令中提取引号包裹的文本，优先返回像 load_more 按钮的文本"""
+        _LOAD_MORE = re.compile(r"load\s*more|加载更多|show\s*more|全部加载", re.I)
+        matches = re.findall(r'["\u201c\u201d\'](.*?)["\u201c\u201d\']', instruction)
+        # 优先返回匹配 load_more 模式的
+        for m in matches:
+            if _LOAD_MORE.search(m):
+                return m.strip()
+        # 都不匹配则返回第一个
+        return matches[0].strip() if matches else None
+
+    @staticmethod
+    def _extract_next_button_text(instruction: str) -> str | None:
+        """从指令引号中提取翻页按钮文本"""
+        _NEXT_PAGE = re.compile(r"下一页|下一頁|next\s*page", re.I)
+        matches = re.findall(r'["\u201c\u201d\'](.*?)["\u201c\u201d\']', instruction)
+        for m in matches:
+            if _NEXT_PAGE.search(m):
+                return m.strip()
+        return None
+
+    @staticmethod
     def _ensure_traversal_hints(hints: list[str], instruction: str) -> list[str]:
-        """关键词兜底：防止 LLM 遗漏用户明确要求的遍历模式"""
         text = instruction.lower()
         checks = {
             "load_more": ["load more", "加载更多", "全部加载", "加载全部"],
@@ -142,74 +142,49 @@ class TaskParser:
 
     @staticmethod
     def _ensure_mode(mode: str, instruction: str) -> str:
-        """关键词兜底：检测 capture 模式"""
-        if mode == "capture":
-            return mode
+        if mode == "capture": return mode
         text = instruction.lower()
         capture_keywords = [
             "复制url", "copy_url", "copy url", "获取链接", "获取下载链接",
             "捕获", "capture", "保存链接", "记录链接", "抓取链接",
             "获取当前url", "获取当前页面url",
         ]
-        if any(kw in text for kw in capture_keywords):
-            return "capture"
+        if any(kw in text for kw in capture_keywords): return "capture"
         return mode
 
     @staticmethod
     def _ensure_max_pages(max_pages: int | None, instruction: str) -> int | None:
-        """正则兜底：从指令中提取用户指定的最大页数"""
-        if max_pages:
-            return max_pages
-        # 匹配常见模式: "第3页停止", "前5页", "最多10页", "翻3页"
+        if max_pages: return max_pages
         patterns = [
-            r'第\s*(\d+)\s*页.*?停',       # 翻到第3页停止
-            r'前\s*(\d+)\s*页',             # 只取前5页
-            r'最多\s*(\d+)\s*页',           # 最多10页
-            r'翻\s*(\d+)\s*页',             # 翻3页
-            r'(\d+)\s*页.*?(?:为止|即可|就行|够了|停止)',  # 3页为止
+            r'第\s*(\d+)\s*页.*?停',
+            r'前\s*(\d+)\s*页',
+            r'最多\s*(\d+)\s*页',
+            r'翻\s*(\d+)\s*页',
+            r'(\d+)\s*页.*?(?:为止|即可|就行|够了|停止)',
         ]
         for pattern in patterns:
             m = re.search(pattern, instruction)
-            if m:
-                return int(m.group(1))
+            if m: return int(m.group(1))
         return None
 
     @staticmethod
     def _extract_samples(instruction: str) -> dict[str, list[str]] | None:
-        """从指令中提取用户提供的 JSONL 样本数据。
-        支持两种格式：
-        1. 每行一个 JSON 对象（标准 JSONL）
-        2. 连续的 JSON 对象（无换行分隔，如 textarea 单行输入）
-        """
         json_objects = []
-
-        # 方式1: 按行匹配 JSON 对象
         for line in instruction.strip().splitlines():
             line = line.strip()
             if line.startswith("{") and line.endswith("}"):
                 try:
                     obj = json.loads(line)
-                    if isinstance(obj, dict):
-                        json_objects.append(obj)
-                except json.JSONDecodeError:
-                    continue
-
-        # 方式2: 如果按行没找到，用正则从整段文本中提取所有 {...} 对象
+                    if isinstance(obj, dict): json_objects.append(obj)
+                except json.JSONDecodeError: continue
         if not json_objects:
             for m in re.finditer(r'\{[^{}]+\}', instruction):
                 try:
                     obj = json.loads(m.group())
-                    if isinstance(obj, dict) and len(obj) >= 2:
-                        json_objects.append(obj)
-                except json.JSONDecodeError:
-                    continue
-
-        if not json_objects:
-            return None
-
+                    if isinstance(obj, dict) and len(obj) >= 2: json_objects.append(obj)
+                except json.JSONDecodeError: continue
+        if not json_objects: return None
         samples = defaultdict(list)
         for obj in json_objects:
-            for key, value in obj.items():
-                samples[key].append(str(value))
-
+            for key, value in obj.items(): samples[key].append(str(value))
         return dict(samples)

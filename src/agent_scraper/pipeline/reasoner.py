@@ -37,7 +37,7 @@ class Reasoner:
     # ── 主循环 ────────────────────────────────────────────
 
     async def run(self, ctx: AgentContext) -> ScrapedResult:
-        plan = self._create_default_plan(ctx.task)
+        plan = self._create_default_plan(ctx.task, has_images=bool(ctx.images))
         logger.info("[Reasoner] 初始计划: %s", [s["tool"] for s in plan])
 
         for attempt in range(ctx.max_retries):
@@ -104,12 +104,48 @@ class Reasoner:
         if not ctx.result:
             ctx.result = ScrapedResult(data=[], total_count=0, source_url=ctx.source_url)
 
+        # ── Anomaly Detection: 对 URL 字段运行异常检测 ──
+        if ctx.result.data and len(ctx.result.data) > 3:
+            self._run_anomaly_detection(ctx)
+
         self._emit("result", {
             "data": ctx.result.data,
             "total": ctx.result.total_count,
             "source_url": ctx.result.source_url,
         })
         return ctx.result
+
+    # ── 异常检测 ──────────────────────────────────────────
+
+    def _run_anomaly_detection(self, ctx: AgentContext):
+        """对结果中的 URL 类字段运行异常检测，有异常则发送 anomaly 事件。"""
+        from agent_scraper.extraction.anomaly import detect_anomalies
+
+        url_indicators = ("url", "链接", "link", "href")
+        fields = ctx.task.extraction_goal.fields
+
+        for field_name, field_desc in fields.items():
+            text = (field_name + " " + field_desc).lower()
+            if not any(kw in text for kw in url_indicators):
+                continue
+            entries = [
+                str(r[field_name]) for r in ctx.result.data
+                if r.get(field_name)
+            ]
+            if len(entries) <= 3:
+                continue
+            try:
+                result = detect_anomalies(entries)
+            except Exception as e:
+                logger.warning("[Reasoner] 异常检测失败: %s", e)
+                continue
+            if result["anomaly_count"] > 0:
+                result["field"] = field_name
+                self._emit("anomaly", result)
+                logger.info(
+                    "[Reasoner] 异常检测: 字段 '%s' 发现 %d 条异常",
+                    field_name, result["anomaly_count"],
+                )
 
     # ── 计划执行 ──────────────────────────────────────────
 
@@ -166,11 +202,22 @@ class Reasoner:
     # ── 计划生成 ──────────────────────────────────────────
 
     @staticmethod
-    def _create_default_plan(task) -> list[dict]:
+    def _create_default_plan(task, has_images: bool = False) -> list[dict]:
         """根据任务类型生成默认执行计划（不含 format，format 在循环外统一执行）"""
         if task.mode == "capture":
             return [{"tool": "capture_navigate"}]
-        # 自由模式（无样本）: browser-use Agent 提取
+
+        # 无样本 + 有截图 → 用 VLM 从截图生成样本，然后走 AutoScraper 路径
+        if not task.extraction_goal.samples and has_images:
+            return [
+                {"tool": "navigate"},
+                {"tool": "vision_sample"},
+                {"tool": "discover_rules"},
+                {"tool": "iterate_pages"},
+                {"tool": "extract"},
+            ]
+
+        # 自由模式（无样本、无截图）: browser-use Agent 提取
         if not task.extraction_goal.samples:
             # 有遍历提示时仍需发现规则和翻页（每页由 Agent 提取）
             if task.extraction_goal.traversal_hints:

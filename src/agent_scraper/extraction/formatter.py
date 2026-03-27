@@ -123,13 +123,19 @@ class Formatter:
         """智能对齐各字段：优先按内容匹配配对，退化为索引截断。
 
         典型场景：file_name=["a.txt","b.csv"] download_url=[".../b.csv",".../a.txt"]
-        按索引 zip 会错位，但按内容匹配（a.txt 出现在 .../a.txt 中）可以正确配对。
+        按索引 zip 会错位，但按内容匹配（a.txt 出现于 .../a.txt 中）可以正确配对。
         """
         if not raw_data:
             return {}
 
         fields = list(raw_data.keys())
         if len(fields) < 2:
+            return raw_data
+
+        # 如果所有字段长度已经一致，说明提取非常整齐，直接跳过智能对齐
+        # 避免因 _match_by_containment 的包含关系匹配不严谨导致数据减少
+        lengths = [len(v) for v in raw_data.values()]
+        if len(set(lengths)) == 1:
             return raw_data
 
         # 尝试找到一对可以通过「文本包含」关系配对的字段

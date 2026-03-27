@@ -21,12 +21,14 @@ class ExtractionGoal(BaseModel):
     # 可选值: "load_more" | "pagination" | "sub_pages" | "next_button"
     traversal_hints: list[str] = []
     max_pages: int | None = None  # 用户指定的最大页数（如"翻到第3页停止"→3）
+    load_more_text: str | None = None  # 用户指定的加载按钮文本（如 "Load more files"、"more>>"）
+    next_button_text: str | None = None  # 用户指定的翻页按钮文本（如 "下一页"、"Next"）
 
 
 class PageRules(BaseModel):
     """LLM 发现的页面遍历规则 — AI 只产出规则，代码执行"""
     # 四种翻页模式，可叠加
-    load_more_selector: str | None = None     # "button:has-text('Load more')"
+    load_more_selector: str | None = None     # CSS 选择器（LLM 发现）
     next_button_selector: str | None = None   # "a.pagination-next"
     pagination_url: str | None = None         # "https://xxx/page/{n}"
     pagination_max: int | None = None         # 最大页数
@@ -34,6 +36,15 @@ class PageRules(BaseModel):
     sub_page_url_attr: str = "href"           # 从哪个属性取URL
     sub_page_url_filter: str | None = None    # URL 过滤关键词，如 "/tree/" 只保留含此的URL
     sub_page_recursive: bool = False          # 是否递归进入子页面的子页面
+
+    def has_traversal(self) -> bool:
+        """是否有任何有效的遍历规则"""
+        return any([
+            self.load_more_selector,
+            self.next_button_selector,
+            self.pagination_url,
+            self.sub_page_selector
+        ])
 
 
 class ParsedTask(BaseModel):

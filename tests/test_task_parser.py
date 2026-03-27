@@ -8,17 +8,15 @@ from agent_scraper.pipeline.task_parser import TaskParser
 
 
 @pytest.fixture
-def mock_client():
-    client = MagicMock()
-    client.chat = MagicMock()
-    client.chat.completions = MagicMock()
-    client.chat.completions.create = AsyncMock()
-    return client
+def mock_llm_service():
+    service = MagicMock()
+    service.call = AsyncMock()
+    return service
 
 
 @pytest.fixture
-def parser(mock_client):
-    return TaskParser(client=mock_client)
+def parser(mock_llm_service):
+    return TaskParser(llm_service=mock_llm_service)
 
 
 class TestExtractSamples:
@@ -84,6 +82,102 @@ some text
         assert samples is None
 
 
+class TestStripTraversalFromSteps:
+    """测试 _strip_traversal_from_steps：遍历操作从导航步骤中剥离"""
+
+    def _make_step(self, action="click", target="", description=""):
+        from agent_scraper.core.models import NavigationStep
+        return NavigationStep(action=action, target=target, description=description)
+
+    def test_target_is_load_more_button(self):
+        """target 本身是 load_more 文本 → 采用为 load_more_text"""
+        steps = [self._make_step(target="Load more files", description="点击加载更多")]
+        clean, hints, text, _ = TaskParser._strip_traversal_from_steps(steps, [])
+        assert clean == []
+        assert "load_more" in hints
+        assert text == "Load more files"
+
+    def test_target_is_nav_tab_not_button(self):
+        """target 是导航标签名（如 "Files and versions"），description 含"加载更多"
+        → 步骤被剥离，但 load_more_text 不应采用 target"""
+        steps = [self._make_step(
+            target="Files and versions",
+            description="点击 Files and versions 标签查看文件列表并加载更多",
+        )]
+        clean, hints, text, _ = TaskParser._strip_traversal_from_steps(steps, [])
+        assert clean == []
+        assert "load_more" in hints
+        assert text is None  # 不应把 "Files and versions" 当成按钮文本
+
+    def test_target_chinese_load_more(self):
+        """中文 target "加载更多" → 采用"""
+        steps = [self._make_step(target="加载更多", description="点击加载按钮")]
+        _, _, text, _ = TaskParser._strip_traversal_from_steps(steps, [])
+        assert text == "加载更多"
+
+    def test_show_more_target(self):
+        """target "Show more" → 采用"""
+        steps = [self._make_step(target="Show more", description="展开更多")]
+        _, _, text, _ = TaskParser._strip_traversal_from_steps(steps, [])
+        assert text == "Show more"
+
+    def test_scroll_load_strips_step(self):
+        """scroll + 滚动加载 → 步骤被剥离"""
+        steps = [self._make_step(action="scroll", target="", description="下滑加载更多内容")]
+        clean, hints, _, _ = TaskParser._strip_traversal_from_steps(steps, [])
+        assert clean == []
+        assert "load_more" in hints
+
+    def test_next_page_stripped(self):
+        """下一页步骤被剥离到 next_button hint，并提取按钮文本"""
+        steps = [self._make_step(target="下一页", description="翻页")]
+        clean, hints, _, next_text = TaskParser._strip_traversal_from_steps(steps, [])
+        assert clean == []
+        assert "next_button" in hints
+        assert next_text == "下一页"
+
+    def test_normal_step_kept(self):
+        """普通导航步骤不应被剥离"""
+        steps = [
+            self._make_step(action="goto", target="https://example.com", description="打开页面"),
+            self._make_step(action="click", target="Files and versions", description="切换标签"),
+        ]
+        clean, hints, text, _ = TaskParser._strip_traversal_from_steps(steps, [])
+        assert len(clean) == 2
+        assert hints == []
+        assert text is None
+
+
+class TestExtractQuotedText:
+    """测试 _extract_quoted_text：从指令中提取引号文本，优先 load_more"""
+
+    def test_single_load_more_quoted(self):
+        instruction = '点击 "Load more files" 加载所有文件'
+        assert TaskParser._extract_quoted_text(instruction) == "Load more files"
+
+    def test_load_more_not_first_quoted(self):
+        """load_more 文本不是第一个引号文本 → 仍优先返回它"""
+        instruction = '进入 "Files and versions" 标签，点击 "Load more files"'
+        assert TaskParser._extract_quoted_text(instruction) == "Load more files"
+
+    def test_chinese_load_more_priority(self):
+        instruction = '点击 "文件列表" 中的 "加载更多" 按钮'
+        assert TaskParser._extract_quoted_text(instruction) == "加载更多"
+
+    def test_no_load_more_returns_first(self):
+        """没有 load_more 匹配 → 返回第一个引号文本"""
+        instruction = '点击 "Files and versions" 标签'
+        assert TaskParser._extract_quoted_text(instruction) == "Files and versions"
+
+    def test_no_quotes(self):
+        instruction = "打开页面提取数据"
+        assert TaskParser._extract_quoted_text(instruction) is None
+
+    def test_chinese_quotes(self):
+        instruction = '点击\u201cLoad more\u201d按钮'
+        assert TaskParser._extract_quoted_text(instruction) == "Load more"
+
+
 class TestEnsureTraversalHints:
     def test_load_more_keywords(self):
         for kw in ["Load more", "加载更多", "全部加载", "加载全部"]:
@@ -126,8 +220,8 @@ class TestEnsureTraversalHints:
 
 class TestParse:
     @pytest.mark.asyncio
-    async def test_basic_parse(self, parser, mock_client):
-        llm_response = json.dumps({
+    async def test_basic_parse(self, parser, mock_llm_service):
+        mock_llm_service.call.return_value = json.dumps({
             "navigation_steps": [
                 {"action": "goto", "target": "https://example.com", "description": "打开"}
             ],
@@ -138,10 +232,6 @@ class TestParse:
                 "traversal_hints": [],
             }
         })
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = llm_response
-        mock_client.chat.completions.create.return_value = mock_resp
 
         task = await parser.parse("打开 example.com 提取标题")
         assert len(task.navigation_steps) == 1
@@ -149,31 +239,27 @@ class TestParse:
         assert "title" in task.extraction_goal.fields
 
     @pytest.mark.asyncio
-    async def test_parse_with_code_block(self, parser, mock_client):
+    async def test_parse_with_code_block(self, parser, mock_llm_service):
         """LLM 返回带 ```json 包裹的内容"""
-        llm_response = "```json\n" + json.dumps({
+        mock_llm_service.call.return_value = "```json\n" + json.dumps({
             "navigation_steps": [],
             "extraction_goal": {
                 "fields": {"name": "名称"},
                 "traversal_hints": ["load_more"],
             }
         }) + "\n```"
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = llm_response
-        mock_client.chat.completions.create.return_value = mock_resp
 
         task = await parser.parse("加载更多")
         assert "load_more" in task.extraction_goal.traversal_hints
 
     @pytest.mark.asyncio
-    async def test_samples_extracted_from_instruction(self, parser, mock_client):
+    async def test_samples_extracted_from_instruction(self, parser, mock_llm_service):
         """指令中包含 JSONL 样本，应被提取"""
         instruction = """\
 打开 https://hf.co 提取文件
 {"file_name": "a.txt", "url": "https://hf.co/a.txt"}
 """
-        llm_response = json.dumps({
+        mock_llm_service.call.return_value = json.dumps({
             "navigation_steps": [
                 {"action": "goto", "target": "https://hf.co", "description": "open"}
             ],
@@ -182,10 +268,6 @@ class TestParse:
                 "traversal_hints": [],
             }
         })
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = llm_response
-        mock_client.chat.completions.create.return_value = mock_resp
 
         task = await parser.parse(instruction)
         assert task.extraction_goal.samples is not None

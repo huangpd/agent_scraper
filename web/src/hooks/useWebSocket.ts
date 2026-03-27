@@ -69,6 +69,13 @@ export function useWebSocket() {
             data: event.data,
           }])
           break
+        case 'anomaly':
+          setMessages(prev => [...prev, {
+            id, type: 'anomaly', timestamp,
+            content: event.data.summary as string,
+            data: event.data,
+          }])
+          break
         case 'error':
           setMessages(prev => [...prev, {
             id, type: 'error', timestamp,

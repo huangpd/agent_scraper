@@ -98,6 +98,15 @@ class Navigator:
         except Exception:
             await browser.stop()
             raise
+
+        # agent.run() 结束时调用 agent.close()，对 keep_alive=True 的浏览器
+        # 会 stop EventBus 并清空 event_queue/_on_idle，导致 BrowserSession
+        # 变成僵尸状态（Chrome 进程存活但事件基础设施死亡）。
+        # 重启 EventBus 让 watchdog、SessionManager 事件恢复正常，
+        # 确保 PageIterator 接管浏览器后遍历页面时不会因为 target detach
+        # 无法恢复而崩溃。
+        browser.event_bus._start()
+
         return browser, history
 
     async def navigate(
@@ -111,12 +120,31 @@ class Navigator:
         else:
             browser = self._create_browser()
 
-        page = await browser.get_current_page()
-        if not page:
+        # Agent.close() 会 stop EventBus，留下僵尸 BrowserSession。
+        # 不复用 Agent 的旧 tab（session 状态不可信），改为：
+        # 新开 tab 导航到同一 URL（干净的 CDP session + target），
+        # PageIterator 拿到全新的 page，不受 Agent 残留状态影响。
+        old_page = await browser.get_current_page()
+        if not old_page:
             raise RuntimeError("无法获取浏览器页面")
 
-        html = await page.evaluate("() => document.documentElement.outerHTML")
-        logger.info("首页 HTML: %.1f KB", len(html) / 1024)
+        current_url = await old_page.get_url()
+        logger.info("Agent 完成，接管浏览器: %s", current_url)
+
+        import asyncio
+        try:
+            # 新开 tab（直接 CDP createTarget，不依赖 EventBus）
+            page = await browser.new_page(current_url)
+            # 设新 tab 为 focus，PageIterator._get_page() 依赖此字段
+            browser.agent_focus_target_id = page._target_id
+            await asyncio.sleep(3)  # 等页面加载
+            html = await page.evaluate("() => document.documentElement.outerHTML")
+            logger.info("新 tab 就绪: %.1f KB", len(html) / 1024)
+        except Exception as e:
+            logger.warning("新开 tab 失败 (%s)，使用 Agent 原有页面", e)
+            page = old_page
+            html = await page.evaluate("() => document.documentElement.outerHTML")
+
         return NavigateResult(browser=browser, page=page, html=html)
 
     async def navigate_and_capture(
