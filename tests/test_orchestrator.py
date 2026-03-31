@@ -24,8 +24,7 @@ async def _async_gen(items):
 def _common_patches():
     """返回新架构需要的所有 patch 对象"""
     return (
-        patch("agent_scraper.core.llm.create_openai_client"),
-        patch("agent_scraper.core.llm.get_model_name", return_value="test-model"),
+        patch("agent_scraper.pipeline.orchestrator.LLMService"),
         patch("agent_scraper.pipeline.orchestrator.TaskParser"),
         patch("agent_scraper.pipeline.orchestrator.Navigator"),
         patch("agent_scraper.pipeline.orchestrator.RuleDiscoverer"),
@@ -41,7 +40,7 @@ class TestAgentScraperRun:
     async def test_full_pipeline(self):
         """mock 所有子组件，验证 ReAct 循环完整执行"""
         patches = _common_patches()
-        (_, _, MockParser, MockNav, MockRuleDisc,
+        (_, MockParser, MockNav, MockRuleDisc,
          MockExtractor, MockFormatter, MockEvaluator, MockPageIter) = [p.start() for p in patches]
 
         try:
@@ -126,7 +125,7 @@ class TestAgentScraperRun:
     async def test_browser_closed_on_error(self):
         """即使出错，浏览器也应被关闭"""
         patches = _common_patches()
-        (_, _, MockParser, MockNav, MockRuleDisc,
+        (_, MockParser, MockNav, MockRuleDisc,
          MockExtractor, MockFormatter, MockEvaluator, MockPageIter) = [p.start() for p in patches]
 
         try:
@@ -147,7 +146,7 @@ class TestAgentScraperRun:
     async def test_capture_fallback_to_extract(self):
         """Capture 失败时应降级到 extract 模式"""
         patches = _common_patches()
-        (_, _, MockParser, MockNav, MockRuleDisc,
+        (_, MockParser, MockNav, MockRuleDisc,
          MockExtractor, MockFormatter, MockEvaluator, MockPageIter) = [p.start() for p in patches]
 
         try:
@@ -206,7 +205,7 @@ class TestAgentScraperRun:
     async def test_eval_retry_on_failure(self):
         """评估未通过时应触发重试"""
         patches = _common_patches()
-        (_, _, MockParser, MockNav, MockRuleDisc,
+        (_, MockParser, MockNav, MockRuleDisc,
          MockExtractor, MockFormatter, MockEvaluator, MockPageIter) = [p.start() for p in patches]
 
         try:
@@ -242,11 +241,11 @@ class TestAgentScraperRun:
             mock_result = ScrapedResult(data=[{"name": "ok"}], total_count=1, source_url="")
             MockFormatter.return_value.format = AsyncMock(return_value=mock_result)
 
-            # 第一次评估未通过（clear_css_cache），第二次通过
+            # 第一次评估未通过（refine_selectors），第二次通过
             MockEvaluator.return_value.evaluate = AsyncMock(side_effect=[
                 EvalResult(
                     passed=False, field_check=False, quality_score=0.2,
-                    issues=["缺少字段"], retry_strategy="clear_css_cache",
+                    issues=["缺少字段"], retry_strategy="refine_selectors",
                 ),
                 EvalResult(passed=True, field_check=True, quality_score=0.9),
             ])

@@ -53,8 +53,7 @@ def _make_mocks():
 
 def _patch_all():
     return (
-        patch("agent_scraper.core.llm.create_openai_client"),
-        patch("agent_scraper.core.llm.get_model_name", return_value="test-model"),
+        patch("agent_scraper.pipeline.orchestrator.LLMService"),
         patch("agent_scraper.pipeline.orchestrator.TaskParser"),
         patch("agent_scraper.pipeline.orchestrator.Navigator"),
         patch("agent_scraper.pipeline.orchestrator.RuleDiscoverer"),
@@ -66,7 +65,7 @@ def _patch_all():
 
 
 def _setup_mocks(patches, mock_task, mock_nav_result, mock_result, pages=None):
-    (_, _, MockParser, MockNav, MockRuleDisc,
+    (_, MockParser, MockNav, MockRuleDisc,
      MockExtractor, MockFormatter, MockEvaluator, MockPageIter) = [p.start() for p in patches]
 
     MockParser.return_value.parse = AsyncMock(return_value=mock_task)

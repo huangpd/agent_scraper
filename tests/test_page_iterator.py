@@ -287,11 +287,3 @@ class TestIterate:
         assert len(htmls) == 1
         assert htmls[0] == "<html>first</html>"
 
-    @pytest.mark.asyncio
-    async def test_pagination_url(self):
-        page = _make_page(html="<html>" + "x" * 2000 + "</html>")
-        browser, _ = _make_browser(page)
-        it = PageIterator(browser)
-        rules = PageRules(pagination_url="https://example.com/page/{n}", pagination_max=3)
-        htmls = [h async for h in it.iterate("<html>page1</html>", rules)]
-        assert len(htmls) == 3

@@ -1,14 +1,22 @@
-"""统一 LLM 服务网关 (AOP 层)"""
+"""统一 LLM 服务网关 (AOP 层) — 基于 LiteLLM"""
 
+import base64
 import json
+import mimetypes
 import os
 import logging
 import time
-from typing import Any
-from openai import AsyncOpenAI
+
+import litellm
 from agent_scraper.core.trace import get_trace_id, increment_llm_count
 
 logger = logging.getLogger(__name__)
+
+# 降低 LiteLLM 自身的日志噪音
+litellm.suppress_debug_info = True
+litellm.drop_params = True
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+logging.getLogger("litellm").setLevel(logging.WARNING)
 
 
 def _fmt_json(obj) -> str:
@@ -18,73 +26,101 @@ def _fmt_json(obj) -> str:
     except (TypeError, ValueError):
         return str(obj)
 
+
 def get_model_name() -> str:
+    """默认模型（轻量调用：任务解析、评估等）"""
     return os.getenv("MODEL_NAME", "gpt-4o")
 
+
+def get_strong_model_name() -> str:
+    """强模型（关键调用：CSS 选择器提取、规则发现）"""
+    return os.getenv("STRONG_MODEL_NAME", os.getenv("MODEL_NAME", "gpt-4o"))
+
+
 class LLMService:
-    """LLM 服务网关：处理 Logging, Tracing, Retries, Costing"""
-    
-    def __init__(self, client: AsyncOpenAI | None = None):
-        self.client = client or AsyncOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL"),
+    """LLM 服务网关：Logging, Tracing, Model Routing"""
+
+    def __init__(self):
+        self.default_model = get_model_name()
+        # LiteLLM 通过环境变量自动读取 API key
+        # 如果用户配置了 OPENAI_BASE_URL，设置为 LiteLLM api_base
+        api_base = os.getenv("OPENAI_BASE_URL")
+        if api_base:
+            litellm.api_base = api_base
+
+    async def call(
+        self,
+        prompt: str,
+        system_msg: str = "",
+        temperature: float = 0.0,
+        caller: str = "LLM",
+        model: str | None = None,
+    ) -> str:
+        """单条 prompt 调用接口（向后兼容），内部委托 call_messages"""
+        messages = [{"role": "user", "content": prompt}]
+        return await self.call_messages(
+            messages, system_msg=system_msg, temperature=temperature,
+            caller=caller, model=model,
         )
-        self.model = get_model_name()
 
-    async def call(self, prompt: str, system_msg: str = "", temperature: float = 0.0, caller: str = "LLM") -> str:
-        """统一调用接口"""
+    async def call_messages(
+        self,
+        messages: list[dict],
+        system_msg: str = "",
+        temperature: float = 0.0,
+        caller: str = "LLM",
+        model: str | None = None,
+    ) -> str:
+        """多消息调用接口（支持 few-shot 对话），model 参数可覆盖默认模型"""
+        use_model = model or self.default_model
         trace_id = get_trace_id()
-        increment_llm_count() # 自动累加计数
+        increment_llm_count()
         start_time = time.perf_counter()
-        
-        messages = []
-        if system_msg:
-            messages.append({"role": "system", "content": system_msg})
-        messages.append({"role": "user", "content": prompt})
 
-        # 1. 完整输入日志
+        full_messages = []
+        if system_msg:
+            full_messages.append({"role": "system", "content": system_msg})
+        full_messages.extend(messages)
+
+        # 输入日志
         logger.info(
-            "[%s][#%s] ── LLM 输入 ──\n  model: %s\n  temperature: %s\n  messages:\n%s",
-            caller, trace_id, self.model, temperature, _fmt_json(messages),
+            "[%s][#%s] ── LLM 输入 ──\n  model: %s\n  temperature: %s\n  messages: %d 条\n%s",
+            caller, trace_id, use_model, temperature, len(full_messages),
+            _fmt_json(full_messages),
         )
 
         try:
-            # 2. 调用转发
-            resp = await self.client.chat.completions.create(
-                model=self.model,
+            resp = await litellm.acompletion(
+                model=use_model,
                 temperature=temperature,
-                messages=messages,
+                messages=full_messages,
             )
 
             content = resp.choices[0].message.content.strip()
             duration = time.perf_counter() - start_time
 
-            # 3. 完整输出日志
             logger.info(
                 "[%s][#%s] ── LLM 输出 (%.2fs) ──\n%s",
                 caller, trace_id, duration, content,
             )
-            
-            # 这里可以扩展 Token 统计逻辑
-            # self._record_tokens(resp.usage)
-            
             return content
 
         except Exception as e:
-            logger.error("[%s][#%s] Failed (%.2fs): %s", caller, trace_id, time.perf_counter() - start_time, str(e))
+            logger.error(
+                "[%s][#%s] Failed (%.2fs): %s",
+                caller, trace_id, time.perf_counter() - start_time, str(e),
+            )
             raise
 
-    async def call_with_images(self, prompt: str, images: list[str], caller: str = "LLM") -> str:
-        """多模态调用接口：文本 + 图片（OpenAI vision 格式）
-
-        Args:
-            prompt: 文本提示词
-            images: 图片列表，每项为 base64 data URL 或 http(s) URL
-            caller: 调用方标识（用于日志）
-        """
-        import base64
-        import mimetypes
-
+    async def call_with_images(
+        self,
+        prompt: str,
+        images: list[str],
+        caller: str = "LLM",
+        model: str | None = None,
+    ) -> str:
+        """多模态调用接口：文本 + 图片"""
+        use_model = model or self.default_model
         trace_id = get_trace_id()
         increment_llm_count()
         start_time = time.perf_counter()
@@ -109,22 +145,22 @@ class LLMService:
 
         messages = [{"role": "user", "content": content}]
 
-        # 输入日志（图片只打 URL 前缀，不打完整 base64）
+        # 输入日志（图片只打 URL 前缀）
         log_content = []
         for part in content:
             if part["type"] == "text":
                 log_content.append(part)
             else:
                 url = part["image_url"]["url"]
-                log_content.append({"type": "image_url", "image_url": {"url": url[:80] + "...", "detail": "high"}})
+                log_content.append({"type": "image_url", "image_url": {"url": url[:80] + "..."}})
         logger.info(
             "[%s][#%s] ── Vision 输入 (%d images) ──\n  model: %s\n  content:\n%s",
-            caller, trace_id, len(images), self.model, _fmt_json(log_content),
+            caller, trace_id, len(images), use_model, _fmt_json(log_content),
         )
 
         try:
-            resp = await self.client.chat.completions.create(
-                model=self.model,
+            resp = await litellm.acompletion(
+                model=use_model,
                 temperature=0.0,
                 messages=messages,
             )
@@ -136,5 +172,8 @@ class LLMService:
             )
             return result
         except Exception as e:
-            logger.error("[%s][#%s] VisionFailed (%.2fs): %s", caller, trace_id, time.perf_counter() - start_time, str(e))
+            logger.error(
+                "[%s][#%s] VisionFailed (%.2fs): %s",
+                caller, trace_id, time.perf_counter() - start_time, str(e),
+            )
             raise

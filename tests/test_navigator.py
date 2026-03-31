@@ -93,7 +93,7 @@ class TestCaptureSuffix:
     def test_json_example(self):
         fields = {"url": "下载链接"}
         suffix = Navigator._capture_suffix(fields)
-        assert '"url"' in suffix
+        assert "url=" in suffix
         assert "<下载链接>" in suffix
 
 
@@ -149,9 +149,12 @@ class TestImagePassedToAgent:
         mock_agent_cls.return_value = mock_agent_instance
 
         mock_browser = MagicMock()
-        mock_page = MagicMock()
-        mock_page.evaluate = AsyncMock(return_value="<html>ok</html>")
-        mock_browser.get_current_page = AsyncMock(return_value=mock_page)
+        mock_old_page = MagicMock()
+        mock_old_page.get_url = AsyncMock(return_value="https://example.com")
+        mock_old_page._target_id = "target-old"
+        mock_old_page.evaluate = AsyncMock(return_value="<html>ok</html>")
+        mock_browser.get_current_page = AsyncMock(return_value=mock_old_page)
+        mock_browser.event_bus = MagicMock()
 
         steps = [NavigationStep(action="goto", target="https://example.com", description="open")]
         images = [FAKE_DATA_URL]
@@ -160,6 +163,10 @@ class TestImagePassedToAgent:
              patch.object(nav, "_create_llm", return_value=MagicMock()), \
              patch("agent_scraper.browser.navigator.Agent", mock_agent_cls):
             result = await nav.navigate(steps, images=images)
+
+        # 应复用原始页面，不开新 tab
+        assert result.page is mock_old_page
+        assert mock_browser.agent_focus_target_id == "target-old"
 
         # Agent 应被创建且收到 sample_images
         mock_agent_cls.assert_called_once()
@@ -183,16 +190,22 @@ class TestImagePassedToAgent:
         mock_agent_cls.return_value = mock_agent_instance
 
         mock_browser = MagicMock()
-        mock_page = MagicMock()
-        mock_page.evaluate = AsyncMock(return_value="<html>ok</html>")
-        mock_browser.get_current_page = AsyncMock(return_value=mock_page)
+        mock_old_page = MagicMock()
+        mock_old_page.get_url = AsyncMock(return_value="https://example.com")
+        mock_old_page._target_id = "target-old"
+        mock_old_page.evaluate = AsyncMock(return_value="<html>ok</html>")
+        mock_browser.get_current_page = AsyncMock(return_value=mock_old_page)
+        mock_browser.event_bus = MagicMock()
 
         steps = [NavigationStep(action="goto", target="https://example.com", description="open")]
 
         with patch.object(nav, "_create_browser", return_value=mock_browser), \
              patch.object(nav, "_create_llm", return_value=MagicMock()), \
              patch("agent_scraper.browser.navigator.Agent", mock_agent_cls):
-            await nav.navigate(steps, images=None)
+            result = await nav.navigate(steps, images=None)
+
+        # 应复用原始页面
+        assert result.page is mock_old_page
 
         call_kwargs = mock_agent_cls.call_args
         passed_images = call_kwargs.kwargs.get("sample_images") or call_kwargs[1].get("sample_images")
@@ -237,3 +250,42 @@ class TestImagePassedToAgent:
         assert "参考截图" in task_text
 
         assert isinstance(result, CaptureResult)
+
+
+class TestNavigateFallbackToNewTab:
+    """原始页面不可用时，应降级到新 tab"""
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_old_page_evaluate_fails(self):
+        nav = Navigator(headless=True)
+
+        mock_agent_cls = MagicMock()
+        mock_agent_instance = MagicMock()
+        mock_agent_instance.run = AsyncMock()
+        mock_agent_cls.return_value = mock_agent_instance
+
+        mock_browser = MagicMock()
+        mock_old_page = MagicMock()
+        mock_old_page.get_url = AsyncMock(return_value="https://example.com")
+        mock_old_page._target_id = "target-old"
+        mock_old_page.evaluate = AsyncMock(side_effect=Exception("target detached"))
+        mock_browser.get_current_page = AsyncMock(return_value=mock_old_page)
+        mock_browser.event_bus = MagicMock()
+
+        mock_new_page = MagicMock()
+        mock_new_page._target_id = "target-new"
+        mock_new_page.evaluate = AsyncMock(return_value="<html>fallback</html>")
+        mock_browser.new_page = AsyncMock(return_value=mock_new_page)
+
+        steps = [NavigationStep(action="goto", target="https://example.com", description="open")]
+
+        with patch.object(nav, "_create_browser", return_value=mock_browser), \
+             patch.object(nav, "_create_llm", return_value=MagicMock()), \
+             patch("agent_scraper.browser.navigator.Agent", mock_agent_cls):
+            result = await nav.navigate(steps)
+
+        # 应降级到新 tab
+        assert result.page is mock_new_page
+        assert result.html == "<html>fallback</html>"
+        assert mock_browser.agent_focus_target_id == "target-new"
+        mock_browser.new_page.assert_awaited_once_with("https://example.com")

@@ -1,12 +1,11 @@
-"""质量评估器：FieldCheck + QualityScore + Replanner
+"""质量评估器：FieldCheck + QualityScore + RetryEscalator
 
 插入在 ExtractTool 之后，将"一次性提取"变成"提取→评估→重试"的自愈闭环。
-- FieldCheck:  字段完整性（程序化）
-- QualityScore: 数量一致性 + 样本对比（程序化）
-- Replanner:   分数不够时 LLM 生成重试策略
+- FieldCheck:      字段完整性（程序化）
+- QualityScore:    数量一致性 + 样本对比（程序化）
+- RetryEscalator:  分数不够时程序化分级升级重试策略（替代 LLM Replanner）
 """
 
-import json
 import logging
 import unicodedata
 from dataclasses import dataclass, field
@@ -14,7 +13,7 @@ from dataclasses import dataclass, field
 from agent_scraper.core.llm import LLMService
 from agent_scraper.core.models import ExtractionGoal
 from agent_scraper.pipeline.context import AgentContext
-from agent_scraper.pipeline.prompts import REPLAN_PROMPT
+from agent_scraper.pipeline.retry_escalator import RetryEscalator
 
 logger = logging.getLogger(__name__)
 
@@ -29,19 +28,20 @@ class EvalResult:
     field_check: bool
     quality_score: float          # 0.0 – 1.0
     issues: list[str] = field(default_factory=list)
-    retry_strategy: str | None = None  # Replanner 建议
+    retry_strategy: str | None = None  # RetryEscalator 决策
 
 class Evaluator:
-    """质量评估 + LLM Replanner"""
+    """质量评估 + 程序化重试策略"""
 
     # 通过阈值，质量评分 ≥ 此值视为通过
     PASS_THRESHOLD = 0.6
 
     def __init__(self, llm_service: LLMService | None = None):
-        self.llm_service = llm_service or LLMService()
+        self.llm_service = llm_service  # 保留兼容性，不再用于 replan
+        self._escalator = RetryEscalator()
 
     async def evaluate(self, ctx: AgentContext) -> EvalResult:
-        """FieldCheck → QualityScore → (失败时) Replanner"""
+        """FieldCheck → QualityScore → (失败时) RetryEscalator"""
         issues: list[str] = []
 
         field_ok = self._field_check(ctx.extracted_data, ctx.task.extraction_goal, issues)
@@ -50,7 +50,10 @@ class Evaluator:
 
         retry_strategy = None
         if not passed and ctx.retry_count < ctx.max_retries - 1:
-            retry_strategy = await self._replan(ctx, issues)
+            self._record_failures(ctx)
+            retry_strategy = self._escalator.decide(
+                ctx.retry_count, issues, ctx.failure_memory,
+            )
 
         result = EvalResult(
             passed=passed,
@@ -60,10 +63,18 @@ class Evaluator:
             retry_strategy=retry_strategy,
         )
         logger.info(
-            "评估: passed=%s, fields=%s, quality=%.2f, issues=%s",
-            passed, field_ok, quality, issues or "无",
+            "评估: passed=%s, fields=%s, quality=%.2f, issues=%s, strategy=%s",
+            passed, field_ok, quality, issues or "无", retry_strategy,
         )
         return result
+
+    @staticmethod
+    def _record_failures(ctx: AgentContext):
+        """将失败的字段记录到 FailureMemory"""
+        expected = set(ctx.task.extraction_goal.fields.keys())
+        got = {k for k, v in ctx.extracted_data.items() if v}
+        for field_name in expected - got:
+            ctx.failure_memory.record_selector_failure(field_name, "<empty>")
 
     # ── FieldCheck ────────────────────────────────────────
 
@@ -129,7 +140,10 @@ class Evaluator:
                     for sv in sample_values:
                         sample_total += 1
                         sv_n = _normalize_text(sv)
-                        if any(sv_n in _normalize_text(str(v)) for v in data[field_name]):
+                        if any(
+                            sv_n in _normalize_text(str(v)) or _normalize_text(str(v)) in sv_n
+                            for v in data[field_name]
+                        ):
                             sample_match += 1
             if sample_total > 0:
                 match_rate = sample_match / sample_total
@@ -139,32 +153,3 @@ class Evaluator:
 
         return sum(scores) / len(scores) if scores else 0.0
 
-    # ── Replanner ─────────────────────────────────────────
-
-    async def _replan(self, ctx: AgentContext, issues: list[str]) -> str:
-        """LLM 根据失败原因建议重试策略"""
-        history_lines = "\n".join(
-            f"  {i + 1}. {s.tool_name}: {'✓' if s.result.success else '✗'} {s.result.summary}"
-            for i, s in enumerate(ctx.steps)
-        )
-        prompt = REPLAN_PROMPT.format(
-            fields=list(ctx.task.extraction_goal.fields.keys()),
-            extracted=json.dumps(
-                {k: len(v) for k, v in ctx.extracted_data.items()}, ensure_ascii=False,
-            ),
-            issues=issues,
-            history=history_lines,
-            retry_count=ctx.retry_count,
-            max_retries=ctx.max_retries,
-        )
-        try:
-            content = await self.llm_service.call(prompt, caller="Evaluator")
-            strategy = content.lower()
-            # 清洗：只保留已知策略名
-            known = {"clear_css_cache", "retry_navigate", "skip"}
-            strategy = strategy if strategy in known else "clear_css_cache"
-            logger.info("Replanner 策略: %s", strategy)
-            return strategy
-        except Exception as e:
-            logger.error("Replanner 失败: %s，默认 clear_css_cache", e)
-            return "clear_css_cache"

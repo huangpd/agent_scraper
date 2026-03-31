@@ -189,13 +189,8 @@ class TestEnsureTraversalHints:
             hints = TaskParser._ensure_traversal_hints([], f"请{kw}")
             assert "sub_pages" in hints
 
-    def test_pagination_keywords(self):
-        for kw in ["翻页", "所有页", "每一页", "分页"]:
-            hints = TaskParser._ensure_traversal_hints([], f"获取{kw}数据")
-            assert "pagination" in hints
-
     def test_next_button_keywords(self):
-        for kw in ["下一页", "next page"]:
+        for kw in ["下一页", "next page", "翻页", "所有页", "每一页", "分页"]:
             hints = TaskParser._ensure_traversal_hints([], f"点击{kw}")
             assert "next_button" in hints
 

@@ -80,9 +80,16 @@ class Navigator:
         )
 
     async def _run_agent(self, task_text: str, images: list[str] | None = None,
-                         max_steps: int | None = None, tools: Tools | None = None):
-        """创建 browser + llm + Agent 并执行，返回 (browser, agent_history)。"""
-        browser = self._create_browser()
+                         max_steps: int | None = None, tools: Tools | None = None,
+                         browser: Browser | None = None):
+        """创建 browser + llm + Agent 并执行，返回 (browser, agent_history)。
+
+        Args:
+            browser: 可选的已有浏览器实例（多实体模式复用）。
+                     如果为 None，创建新浏览器。
+        """
+        if browser is None:
+            browser = self._create_browser()
         llm = self._create_llm()
         sample_images = self._convert_images(images)
         if sample_images:
@@ -110,20 +117,24 @@ class Navigator:
         return browser, history
 
     async def navigate(
-        self, steps: list[NavigationStep], images: list[str] | None = None
+        self, steps: list[NavigationStep], images: list[str] | None = None,
+        browser: Browser | None = None,
     ) -> NavigateResult:
-        """Agent 执行导航步骤，返回 browser + page + 首页 HTML。"""
+        """Agent 执行导航步骤，返回 browser + page + 首页 HTML。
+
+        Args:
+            browser: 可选的已有浏览器实例（多实体模式复用同一浏览器）。
+        """
         agent_steps = [s for s in steps if s.action in ("goto", "click", "wait", "input")]
         if agent_steps:
             task_text = self._format_steps(agent_steps)
-            browser, _ = await self._run_agent(task_text, images)
-        else:
+            browser, _ = await self._run_agent(task_text, images, browser=browser)
+        elif browser is None:
             browser = self._create_browser()
 
-        # Agent.close() 会 stop EventBus，留下僵尸 BrowserSession。
-        # 不复用 Agent 的旧 tab（session 状态不可信），改为：
-        # 新开 tab 导航到同一 URL（干净的 CDP session + target），
-        # PageIterator 拿到全新的 page，不受 Agent 残留状态影响。
+        # Agent 完成导航后，优先复用原始页面（保留客户端筛选状态）。
+        # event_bus._start() 已重启事件基础设施，old_page 的 CDP session 仍可用。
+        # 仅当 old_page 不可用时（target detached）才降级到新 tab。
         old_page = await browser.get_current_page()
         if not old_page:
             raise RuntimeError("无法获取浏览器页面")
@@ -133,16 +144,18 @@ class Navigator:
 
         import asyncio
         try:
-            # 新开 tab（直接 CDP createTarget，不依赖 EventBus）
-            page = await browser.new_page(current_url)
-            # 设新 tab 为 focus，PageIterator._get_page() 依赖此字段
-            browser.agent_focus_target_id = page._target_id
-            await asyncio.sleep(3)  # 等页面加载
-            html = await page.evaluate("() => document.documentElement.outerHTML")
-            logger.info("新 tab 就绪: %.1f KB", len(html) / 1024)
-        except Exception as e:
-            logger.warning("新开 tab 失败 (%s)，使用 Agent 原有页面", e)
+            # 复用 Agent 原始页面（保留客户端 DOM 状态：筛选、JS 渲染等）
+            browser.agent_focus_target_id = old_page._target_id
+            await asyncio.sleep(1)
+            html = await old_page.evaluate("() => document.documentElement.outerHTML")
             page = old_page
+            logger.info("复用 Agent 原始页面: %.1f KB", len(html) / 1024)
+        except Exception as e:
+            # CDP target detached → 降级到新 tab（丢失客户端状态，但能继续）
+            logger.warning("原始页面不可用 (%s)，降级到新 tab", e)
+            page = await browser.new_page(current_url)
+            browser.agent_focus_target_id = page._target_id
+            await asyncio.sleep(3)
             html = await page.evaluate("() => document.documentElement.outerHTML")
 
         return NavigateResult(browser=browser, page=page, html=html)

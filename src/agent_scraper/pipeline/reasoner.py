@@ -74,8 +74,10 @@ class Reasoner:
                 )
                 if attempt < ctx.max_retries - 1 and eval_result.retry_strategy:
                     if eval_result.retry_strategy == "skip":
-                        logger.info("[Reasoner] Replanner 建议 skip，接受当前结果")
+                        logger.info("[Reasoner] 策略 skip，接受当前结果")
                         break
+                    # 重试前快照，失败可回滚
+                    snapshot = ctx.checkpoint()
                     plan = self._apply_retry_strategy(ctx, eval_result.retry_strategy)
                     logger.info(
                         "[Reasoner] 重试策略: %s → 新计划: %s",
@@ -217,16 +219,18 @@ class Reasoner:
                 {"tool": "extract"},
             ]
 
-        # 自由模式（无样本、无截图）: browser-use Agent 提取
+        # 自由模式（无样本、无截图）
         if not task.extraction_goal.samples:
-            # 有遍历提示时仍需发现规则和翻页（每页由 Agent 提取）
             if task.extraction_goal.traversal_hints:
+                # 多页遍历: bootstrap 生成样本 → AutoScraper 跨页复用
                 return [
                     {"tool": "navigate"},
+                    {"tool": "bootstrap_samples"},
                     {"tool": "discover_rules"},
                     {"tool": "iterate_pages"},
                     {"tool": "extract"},
                 ]
+            # 单页: browser-use Agent 直接提取，不需要训练 AutoScraper
             return [
                 {"tool": "navigate"},
                 {"tool": "extract"},
@@ -245,22 +249,32 @@ class Reasoner:
     # ── 重试策略 → 新计划 ────────────────────────────────
 
     def _apply_retry_strategy(self, ctx: AgentContext, strategy: str) -> list[dict]:
-        """根据 Replanner 的策略生成新执行计划"""
+        """根据 RetryEscalator 的分级策略生成新执行计划"""
 
-        if strategy == "clear_css_cache":
-            # 清除 Extractor 缓存，重新遍历+提取（HTML 不再缓存，需重新访问）
+        if strategy == "refine_selectors":
+            # L0: 只清 CSS 缓存，保留 AutoScraper 模型
+            extract_tool = self.tools.get("extract")
+            if isinstance(extract_tool, ExtractTool):
+                extract_tool.clear_css_cache()
+            ctx.extracted_data = {}
+            return [{"tool": "iterate_pages"}, {"tool": "extract"}]
+
+        if strategy == "clear_and_regenerate":
+            # L1: 全部清除，从头提取
             extract_tool = self.tools.get("extract")
             if isinstance(extract_tool, ExtractTool):
                 extract_tool.clear_cache()
-            ctx.extracted_data = {}  # 清空旧数据
-            return [{"tool": "iterate_pages"}]
-
-        if strategy == "retry_navigate":
-            # 完全重来：重新导航 + 发现规则 + 遍历 + 提取
-            extract_tool = self.tools.get("extract")
-            if isinstance(extract_tool, ExtractTool):
-                extract_tool.clear_cache()
+            ctx.extracted_data = {}
             return self._create_extract_plan()
+
+        if strategy == "switch_strategy":
+            # L2: 放弃 CSS/AutoScraper，切换到 browser-use Agent 提取
+            ctx.task.extraction_goal.samples = None
+            ctx.extracted_data = {}
+            extract_tool = self.tools.get("extract")
+            if isinstance(extract_tool, ExtractTool):
+                extract_tool.clear_cache()
+            return [{"tool": "navigate"}, {"tool": "extract"}]
 
         # "skip" 或未知策略 → 不执行任何工具，直接进入 format
         return []

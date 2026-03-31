@@ -61,12 +61,20 @@ class TaskParser:
             next_button_text=next_button_text,
         )
 
-        return ParsedTask(
+        task = ParsedTask(
             navigation_steps=steps,
             extraction_goal=goal,
             raw_instruction=instruction,
             mode=mode,
         )
+
+        # OutputGuard 后置校验
+        from agent_scraper.pipeline.output_guard import validate_task
+        issues = validate_task(task)
+        if issues:
+            logger.warning("[TaskParser] 解析结果存在问题: %s", issues)
+
+        return task
 
     @staticmethod
     def _strip_traversal_from_steps(
@@ -132,8 +140,7 @@ class TaskParser:
         checks = {
             "load_more": ["load more", "加载更多", "全部加载", "加载全部"],
             "sub_pages": ["进入每个文件夹", "遍历子页面", "每个文件夹", "进入文件夹", "子文件夹"],
-            "pagination": ["翻页", "所有页", "每一页", "分页"],
-            "next_button": ["下一页", "next page"],
+            "next_button": ["下一页", "next page", "翻页", "所有页", "每一页", "分页"],
         }
         for hint_type, keywords in checks.items():
             if hint_type not in hints and any(kw in text for kw in keywords):
