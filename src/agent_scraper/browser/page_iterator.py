@@ -13,7 +13,7 @@ from agent_scraper.core.models import PageRules
 
 logger = logging.getLogger(__name__)
 
-# 未指定 max_pages 时的默认翻页上限（pagination_url 和 next_button 共用）
+# 未指定 max_pages 时的默认翻页上限
 DEFAULT_MAX_PAGES = 20
 
 
@@ -130,13 +130,7 @@ class PageIterator:
             ):
                 yield html
 
-        # 3. pagination URL 模式
-        elif rules.pagination_url:
-            yield first_html
-            async for html in self._do_pagination_url(rules.pagination_url, max_pages or DEFAULT_MAX_PAGES):
-                yield html
-
-        # 4. next_button 翻页: selector 优先，文本兜底
+        # 3. next_button 翻页: selector 优先，文本兜底
         elif rules.next_button_selector or next_button_text:
             yield first_html
             async for html in self._do_next_button(
@@ -146,7 +140,7 @@ class PageIterator:
             ):
                 yield html
 
-        # 5. 无规则: 单页
+        # 4. 无规则: 单页
         else:
             yield first_html
 
@@ -161,6 +155,7 @@ class PageIterator:
         """
         click_count = 0
         prev_height = 0
+        stale_count = 0  # 连续高度变化极小的次数
         use_xpath = bool(xpath)
         try:
             while click_count < max_clicks:
@@ -198,6 +193,14 @@ class PageIterator:
                 if cur_height == prev_height:
                     logger.info("load_more 页面无变化，停止")
                     break
+                # 连续多次高度变化极小（<100px）说明已接近尾声
+                if prev_height > 0 and cur_height - prev_height < 100:
+                    stale_count += 1
+                    if stale_count >= 3:
+                        logger.info("load_more 连续 %d 次高度变化极小，停止", stale_count)
+                        break
+                else:
+                    stale_count = 0
                 prev_height = cur_height
         except Exception as e:
             if click_count > 0:
@@ -262,20 +265,46 @@ class PageIterator:
 
     @staticmethod
     async def _click_by_text(page, text: str) -> bool:
-        """通过文本匹配点击按钮或链接（JS evaluate）"""
+        """通过文本匹配点击按钮或链接（JS evaluate）。
+
+        两轮匹配：
+        1. 精确匹配（trimmed text ≈ 搜索文本，长度差 ≤ 2倍）
+        2. 宽松子串匹配（仅 button/[role=button]，排除普通 <a>）
+        """
         result = await page.evaluate("""(text) => {
-            const els = document.querySelectorAll(
+            const lower = text.toLowerCase();
+            const allEls = document.querySelectorAll(
                 'button, a, [role="button"], [role="link"], '
                 + 'input[type="button"], input[type="submit"]');
-            const lower = text.toLowerCase();
-            for (const el of els) {
-                if (!el.textContent.trim().toLowerCase().includes(lower)) continue;
-                const style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+            function isVisible(el) {
+                const s = window.getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden';
+            }
+
+            // 第 1 轮：精确匹配（元素文本长度不超过搜索文本的 2 倍）
+            for (const el of allEls) {
+                const t = el.textContent.trim().toLowerCase();
+                if (!t.includes(lower)) continue;
+                if (t.length > lower.length * 2) continue;
+                if (!isVisible(el)) continue;
                 el.scrollIntoView({block: 'center'});
                 el.click();
                 return 'clicked';
             }
+
+            // 第 2 轮：宽松子串，但只匹配 button 类元素（排除普通 <a> 防误点链接）
+            const btnOnly = document.querySelectorAll(
+                'button, [role="button"], input[type="button"], input[type="submit"]');
+            for (const el of btnOnly) {
+                const t = el.textContent.trim().toLowerCase();
+                if (!t.includes(lower)) continue;
+                if (!isVisible(el)) continue;
+                el.scrollIntoView({block: 'center'});
+                el.click();
+                return 'clicked';
+            }
+
             return '';
         }""", text)
         return result == "clicked"
@@ -340,9 +369,9 @@ class PageIterator:
                     html = await self._get_html()
                     page_xpath = self._find_load_more_xpath(html, load_more_text)
 
-                # 每个子页面都尝试 Load more
+                # 每个子页面都尝试 Load more（上限比主页面低）
                 await self._try_load_more(selector=load_more_selector, xpath=page_xpath,
-                                          button_text=load_more_text or "")
+                                          button_text=load_more_text or "", max_clicks=20)
 
                 html = await self._get_html()
                 yield html
@@ -417,26 +446,6 @@ class PageIterator:
                 seen.add(full)
                 urls.append(full)
         return urls
-
-    # ── pagination URL ───────────────────────────────────
-
-    async def _do_pagination_url(self, url_pattern: str, max_pages: int) -> AsyncGenerator[str, None]:
-        """URL 模板分页。max_pages 为总页数（含第1页）。"""
-        logger.info("URL 分页: max=%d 页", max_pages)
-        for n in range(2, max_pages + 1):  # 第1页已有，从第2页开始
-            url = url_pattern.replace("{n}", str(n))
-            try:
-                await self._goto(url)
-                html = await self._get_html()
-                if len(html) < 1000:
-                    logger.info("第 %d 页内容过少，停止", n)
-                    break
-                yield html
-                if n % 5 == 0:
-                    logger.info("已完成 %d 页...", n)
-            except Exception as e:
-                logger.error("分页 %d 失败: %s，停止", n, e)
-                break
 
     # ── next_button ──────────────────────────────────────
 

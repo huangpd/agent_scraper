@@ -15,6 +15,7 @@ from agent_scraper.pipeline.task_parser import TaskParser
 from agent_scraper.core.llm import LLMService
 from agent_scraper.core.trace import trace_scope, get_llm_count
 from agent_scraper.pipeline.tools import (
+    BootstrapSamplesTool,
     CaptureNavigateTool,
     DiscoverRulesTool,
     ExtractTool,
@@ -51,6 +52,7 @@ class AgentScraper:
         self.registry.register(NavigateTool(navigator))
         self.registry.register(CaptureNavigateTool(navigator))
         self.registry.register(DiscoverRulesTool(rule_discoverer))
+        self.registry.register(BootstrapSamplesTool(extractor))
         self.registry.register(IteratePagesTool(extractor))
         self.registry.register(ExtractTool(extractor))
         self.registry.register(VisionSampleTool(self.llm_service))

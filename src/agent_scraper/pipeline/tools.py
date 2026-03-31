@@ -102,7 +102,11 @@ class ToolRegistry:
 
 
 class NavigateTool(Tool):
-    """浏览器导航：Agent 执行步骤到达目标页面，返回 HTML"""
+    """浏览器导航：Agent 执行步骤到达目标页面，返回 HTML
+
+    支持多实体模式：步骤中有 extract_point=True 时按提取点分组执行，
+    每组结束后缓存页面 HTML 到 ctx.html_cache。
+    """
 
     name = "navigate"
     description = "使用浏览器 Agent 执行导航步骤到达目标页面，返回页面 HTML"
@@ -119,22 +123,27 @@ class NavigateTool(Tool):
                 pass
             ctx.browser = None
 
+        steps = ctx.task.navigation_steps
+        groups = self._split_at_extract_points(steps)
+
+        if len(groups) > 1:
+            return await self._execute_multi_entity(ctx, groups)
+
+        return await self._execute_single(ctx, steps)
+
+    async def _execute_single(self, ctx: AgentContext, steps) -> ToolResult:
+        """单目标导航（现有逻辑）"""
         try:
-            # 仅复杂导航（多步骤 / 含点击等交互）才传截图作参考
-            # 简单 goto 不需要截图，避免标注截图干扰 Agent
-            steps = ctx.task.navigation_steps
             needs_visual = any(s.action != "goto" for s in steps)
             nav = await self._nav.navigate(
                 steps, images=ctx.images if needs_visual else None,
             )
             ctx.browser = nav.browser
             ctx.html = nav.html
-            # 从浏览器获取实际 URL（处理重定向/SPA 路由跳转）
             try:
                 ctx.source_url = await ctx.browser.get_current_page_url()
             except Exception:
                 pass
-            # 兜底：浏览器取不到时从 goto 步骤推断
             if not ctx.source_url:
                 for step in ctx.task.navigation_steps:
                     if step.action == "goto":
@@ -147,6 +156,76 @@ class NavigateTool(Tool):
             )
         except Exception as e:
             return ToolResult(success=False, error=str(e), summary=f"导航失败: {e}")
+
+    async def _execute_multi_entity(self, ctx: AgentContext, groups: list[list]) -> ToolResult:
+        """多实体导航：分组执行，每组结束后缓存 HTML"""
+        ctx.html_cache = []
+        try:
+            for i, group in enumerate(groups):
+                logger.info("[NavigateTool] 多实体导航: 组 %d/%d (%d 步)",
+                            i + 1, len(groups), len(group))
+                needs_visual = i == 0 and any(s.action != "goto" for s in group)
+                nav = await self._nav.navigate(
+                    group,
+                    images=ctx.images if needs_visual else None,
+                    browser=ctx.browser,
+                )
+                ctx.browser = nav.browser
+                # extract_point 组：缓存 (url, html)
+                if group[-1].extract_point:
+                    try:
+                        page_url = await ctx.browser.get_current_page_url()
+                    except Exception:
+                        page_url = ""
+                    ctx.html_cache.append((page_url, nav.html))
+                    logger.info("[NavigateTool]   缓存页面 %d: %.0fKB (%s)",
+                                len(ctx.html_cache), len(nav.html) / 1024, page_url)
+
+            # 兼容下游：html 设为最后一页
+            ctx.html = ctx.html_cache[-1][1] if ctx.html_cache else ""
+            try:
+                ctx.source_url = await ctx.browser.get_current_page_url()
+            except Exception:
+                pass
+
+            return ToolResult(
+                success=True,
+                data={"html_size": sum(len(h) for _, h in ctx.html_cache),
+                      "page_count": len(ctx.html_cache)},
+                summary=f"多实体导航完成，缓存 {len(ctx.html_cache)} 个页面",
+            )
+        except Exception as e:
+            cached = len(ctx.html_cache)
+            if cached:
+                ctx.html = ctx.html_cache[-1][1]
+                return ToolResult(
+                    success=True,
+                    error=str(e),
+                    summary=f"多实体导航部分完成: {cached} 个页面已缓存，第 {cached + 1} 组失败: {e}",
+                )
+            return ToolResult(success=False, error=str(e), summary=f"多实体导航失败: {e}")
+
+    @staticmethod
+    def _split_at_extract_points(steps: list) -> list[list]:
+        """在 extract_point=True 的步骤处切割为多个组。
+
+        每组以 extract_point=True 的步骤结尾（最后一组除外）。
+        无 extract_point 时返回单组（现有行为）。
+        """
+        if not any(s.extract_point for s in steps):
+            return [steps]
+
+        groups = []
+        current = []
+        for step in steps:
+            current.append(step)
+            if step.extract_point:
+                groups.append(current)
+                current = []
+        # 尾部残余（extract_point 后还有步骤）
+        if current:
+            groups.append(current)
+        return groups
 
 
 class CaptureNavigateTool(Tool):
@@ -192,7 +271,6 @@ _HINT_RULE_MAP = {
     "load_more": lambda r: r.load_more_selector,
     "sub_pages": lambda r: r.sub_page_selector,
     "next_button": lambda r: r.next_button_selector,
-    "pagination": lambda r: r.pagination_url,
 }
 
 def _check_missing(hints: list[str], rules) -> list[str]:
@@ -220,38 +298,41 @@ class DiscoverRulesTool(Tool):
 
     async def execute(self, ctx: AgentContext, **params) -> ToolResult:
         from agent_scraper.core.models import PageRules
-        from agent_scraper.extraction.rule_discoverer import RuleDiscoverer
+        from agent_scraper.pipeline.output_guard import validate_page_rules
 
         hints = ctx.task.extraction_goal.traversal_hints or []
 
         try:
-            # 1. 首次发现
+            # 1. 首次发现（纯生成，不含内部校验）
             rules = await self._discoverer.discover(
                 ctx.html, ctx.source_url, hints,
             )
 
-            # 2. CSS selector 真实性校验（防幻觉）
+            # 2. OutputGuard 统一校验（替代之前的双重 validate_selectors）
+            failures = []
             if ctx.html:
-                invalid = RuleDiscoverer.validate_selectors(ctx.html, rules)
-                if invalid:
-                    logger.warning("LLM 幻觉 selector: %s 在页面中无匹配，已清除", invalid)
-                    rules = rules.model_copy(update={f: None for f in invalid})
+                rules, failures = validate_page_rules(rules, ctx.html)
+                if failures:
+                    logger.warning("OutputGuard 清除无效 selector: %s",
+                                   [f["field"] for f in failures])
 
             # 3. 用户意图校验：哪些 hint 没找到规则？
             missing = _check_missing(hints, rules)
 
-            # 4. 缺失时重试一次（用更聚焦的提示词）
+            # 4. 缺失时重试一次（带失败反馈的提示词）
             if missing:
-                logger.info("用户要求 %s 未发现规则，重试...", missing)
+                logger.info("用户要求 %s 未发现规则，重试（附带 %d 条失败反馈）...",
+                            missing, len(failures))
                 retry_rules = await self._discoverer.discover_retry(
                     ctx.html, ctx.source_url, missing, missing_modes=missing,
+                    failed_attempts=failures,
                 )
-                # 重试结果也要校验
+                # 重试结果也用 OutputGuard 校验
                 if ctx.html:
-                    invalid2 = RuleDiscoverer.validate_selectors(ctx.html, retry_rules)
-                    if invalid2:
-                        logger.warning("重试仍幻觉: %s，已清除", invalid2)
-                        retry_rules = retry_rules.model_copy(update={f: None for f in invalid2})
+                    retry_rules, failures2 = validate_page_rules(retry_rules, ctx.html)
+                    if failures2:
+                        logger.warning("重试仍无效: %s，已清除",
+                                       [f["field"] for f in failures2])
                 rules = _merge_rules(rules, retry_rules)
                 missing = _check_missing(hints, rules)
 
@@ -265,8 +346,6 @@ class DiscoverRulesTool(Tool):
                 info.append(f"sub_page='{rules.sub_page_selector}'")
             if rules.next_button_selector:
                 info.append(f"next_button='{rules.next_button_selector}'")
-            if rules.pagination_url:
-                info.append(f"pagination='{rules.pagination_url}'")
 
             summary = ", ".join(info) if info else "无遍历规则（单页模式）"
 
@@ -295,6 +374,74 @@ class DiscoverRulesTool(Tool):
                 success=True,
                 summary=f"规则发现异常，降级为单页: {e}",
             )
+
+
+class BootstrapSamplesTool(Tool):
+    """无样本时，首页 LLM 提取 → 校验 → 生成 AutoScraper 样本
+
+    职责分离：IteratePagesTool 不再含 bootstrap 逻辑。
+    Bootstrap 通过 ctx.set_samples() 安全写入，不直接操作 Extractor 内部。
+    """
+
+    name = "bootstrap_samples"
+    description = "无样本时从首页 HTML 自动提取并生成 AutoScraper 训练样本"
+
+    def __init__(self, extractor):
+        self._extractor = extractor
+
+    async def execute(self, ctx: AgentContext, **params) -> ToolResult:
+        from agent_scraper.pipeline.output_guard import validate_samples
+
+        goal = ctx.task.extraction_goal
+
+        # 已有样本（用户提供 / VisionSample 生成），跳过
+        if goal.samples:
+            return ToolResult(success=True, data={}, summary="已有样本，跳过 bootstrap")
+
+        if not ctx.html:
+            return ToolResult(success=False, error="无 HTML", summary="Bootstrap: 无 HTML 可用")
+
+        try:
+            # 首页 LLM CSS 提取
+            page_data = await self._extractor.extract(ctx.html, goal)
+            total = sum(len(v) for v in page_data.values())
+
+            if total == 0:
+                return ToolResult(
+                    success=True,  # 不致命，下游降级到 browser-use Agent
+                    data={},
+                    summary="Bootstrap: 首页 LLM 提取为空，无法生成样本",
+                )
+
+            # 取前 2 条作为候选样本
+            candidate_samples = {k: v[:2] for k, v in page_data.items() if v}
+
+            # OutputGuard 校验：样本值必须存在于 HTML 中
+            validated = validate_samples(candidate_samples, ctx.html)
+            if not validated:
+                return ToolResult(
+                    success=True,
+                    data={},
+                    summary="Bootstrap: 样本校验失败（不存在于 HTML），放弃",
+                )
+
+            # 安全写入样本
+            ctx.set_samples(validated)
+
+            # 清除 Extractor 缓存，让 AutoScraper 基于新样本重新训练
+            self._extractor._css_rule_cache.clear()
+            self._extractor._trained_scraper = None
+
+            sample_info = {k: len(v) for k, v in validated.items()}
+            return ToolResult(
+                success=True,
+                data=validated,
+                summary=f"Bootstrap 生成样本: {sample_info}",
+            )
+        except Exception as e:
+            logger.warning("[BootstrapSamples] 失败: %s，将走无样本模式", e)
+            return ToolResult(success=True, error=str(e),
+                              summary=f"Bootstrap 失败，降级无样本: {e}")
 
 
 class IteratePagesTool(Tool):
@@ -327,7 +474,7 @@ class IteratePagesTool(Tool):
 
         rules = ctx.page_rules or PageRules()
         overrides = {}
-        # 用户指定的 max_pages 优先于规则发现的 pagination_max
+        # 用户指定的 max_pages 优先于 LLM 发现的 pagination_max
         user_max = ctx.task.extraction_goal.max_pages
         if user_max:
             overrides["pagination_max"] = user_max
@@ -342,6 +489,8 @@ class IteratePagesTool(Tool):
             page_count = 0
             skipped_pages = 0
 
+            goal = ctx.task.extraction_goal
+
             async for html in iterator.iterate(
                 ctx.html, rules, ctx.source_url,
                 load_more_text=load_more_text,
@@ -352,18 +501,24 @@ class IteratePagesTool(Tool):
                 ctx.on_event("progress", {"current": page_count, "total": 0})
 
                 if self._extractor and has_samples:
-                    page_data = await self._extractor.extract(html, ctx.task.extraction_goal)
-                    # 跳过字段数量不一致的页面，避免污染全局对齐
+                    page_data = await self._extractor.extract(html, goal)
+                    # 字段数量对齐：按最短字段截断，小幅差异容忍
                     counts = [len(v) for v in page_data.values()]
-                    if page_data and len(set(counts)) > 1:
-                        logger.warning("  页面 [%d] 字段数量不一致 %s，跳过",
-                                       page_count, {k: len(v) for k, v in page_data.items()})
-                        skipped_pages += 1
-                    else:
-                        for key, values in page_data.items():
-                            all_data.setdefault(key, []).extend(values)
-                        # 增量保存：每页提取后立即写入 ctx，防止中途崩溃丢数据
-                        ctx.extracted_data = all_data
+                    if page_data and counts:
+                        min_count = min(counts)
+                        max_count = max(counts)
+                        if min_count == 0:
+                            logger.warning("  页面 [%d] 存在空字段 %s，跳过",
+                                           page_count, {k: len(v) for k, v in page_data.items()})
+                            skipped_pages += 1
+                        else:
+                            if min_count != max_count:
+                                logger.info("  页面 [%d] 字段数量微差 %s，截断对齐到 %d 条",
+                                            page_count, {k: len(v) for k, v in page_data.items()}, min_count)
+                                page_data = {k: v[:min_count] for k, v in page_data.items()}
+                            for key, values in page_data.items():
+                                all_data.setdefault(key, []).extend(values)
+                            ctx.extracted_data = all_data
 
             if all_data:
                 ctx.extracted_data = all_data
@@ -433,6 +588,10 @@ class ExtractTool(Tool):
         self._extractor = extractor
 
     async def execute(self, ctx: AgentContext, **params) -> ToolResult:
+        # 多实体缓存池：逐页提取并合并
+        if ctx.html_cache:
+            return await self._extract_from_cache(ctx)
+
         has_samples = bool(ctx.task.extraction_goal.samples)
 
         # 自由模式: 无样本 → browser-use Agent + output_model
@@ -477,6 +636,64 @@ class ExtractTool(Tool):
                 return ToolResult(success=False, error=str(e), summary=f"提取失败: {e}")
 
         return ToolResult(success=False, error="无 HTML 页面", summary="没有可提取的页面")
+
+    # ── 多实体缓存池提取 ────────────────────────────────────
+
+    async def _extract_from_cache(self, ctx: AgentContext) -> ToolResult:
+        """从 html_cache 中逐页提取，合并结果。
+
+        每个缓存项是 (url, html)。提取时导航到对应 URL 让 browser-use Agent
+        在真实页面上操作，避免通过 JS 注入 MB 级 HTML 字符串。
+        """
+        import asyncio
+
+        fields = ctx.task.extraction_goal.fields
+        all_data: dict[str, list] = {f: [] for f in fields}
+        success_count = 0
+
+        for i, (url, html) in enumerate(ctx.html_cache):
+            logger.info("[ExtractTool] 多实体提取: 页面 %d/%d (%.0fKB) %s",
+                        i + 1, len(ctx.html_cache), len(html) / 1024, url)
+
+            original_html = ctx.html
+            ctx.html = html
+            try:
+                # 导航到缓存的 URL，让 Agent 在真实页面上提取
+                if ctx.browser and url:
+                    page = await ctx.browser.get_current_page()
+                    if page:
+                        await page.goto(url)
+                        await asyncio.sleep(3)  # 等待页面加载
+
+                page_result = await self._browser_agent_extract(ctx)
+                if page_result.success and ctx.extracted_data:
+                    for field_name in fields:
+                        values = ctx.extracted_data.get(field_name, [])
+                        all_data[field_name].extend(values)
+                    success_count += 1
+                    logger.info("[ExtractTool]   页面 %d 提取: %s",
+                                i + 1, {k: len(v) for k, v in ctx.extracted_data.items()})
+                else:
+                    logger.warning("[ExtractTool]   页面 %d 提取失败: %s",
+                                   i + 1, page_result.error)
+            except Exception as e:
+                logger.warning("[ExtractTool]   页面 %d 提取异常: %s", i + 1, e)
+            finally:
+                ctx.html = original_html
+
+        ctx.extracted_data = all_data
+        field_counts = {k: len(v) for k, v in all_data.items()}
+        total = sum(field_counts.values())
+
+        summary = (f"多实体提取: {success_count}/{len(ctx.html_cache)} 个页面成功, "
+                   f"共 {total} 条数据 {field_counts}")
+
+        return ToolResult(
+            success=total > 0,
+            data=field_counts,
+            summary=summary,
+            error=None if total > 0 else "所有页面提取失败",
+        )
 
     # ── 提取摘要构建 ──────────────────────────────────────
 
@@ -634,8 +851,12 @@ class ExtractTool(Tool):
 
         return []
 
+    def clear_css_cache(self):
+        """只清除 CSS 选择器缓存，保留 AutoScraper 模型（L0 refine_selectors 使用）"""
+        self._extractor._css_rule_cache.clear()
+
     def clear_cache(self):
-        """清除 CSS 选择器缓存和 AutoScraper 训练模型（供重试使用）"""
+        """清除所有缓存：CSS 选择器 + AutoScraper 训练模型（L1+ 使用）"""
         self._extractor._css_rule_cache.clear()
         self._extractor._trained_scraper = None
 
@@ -687,8 +908,18 @@ class VisionSampleTool(Tool):
             visible_samples: dict[str, list[str]] = json.loads(raw)
             logger.info("[VisionSample] VLM 识别结果: %s", visible_samples)
 
-            # 3. 写入 samples（URL 字段不需要样本，由 Extractor XPath 推导）
-            ctx.task.extraction_goal.samples = visible_samples
+            # 3. OutputGuard 校验：样本值必须存在于 HTML 中
+            if ctx.html:
+                from agent_scraper.pipeline.output_guard import validate_samples
+                visible_samples = validate_samples(visible_samples, ctx.html)
+                if not visible_samples:
+                    return ToolResult(
+                        success=True, error="VLM 样本校验失败（不存在于 HTML）",
+                        summary="VisionSample: 样本校验失败，降级无样本",
+                    )
+
+            # 4. 安全写入 samples
+            ctx.set_samples(visible_samples)
             field_info = {k: len(v) for k, v in visible_samples.items()}
             return ToolResult(
                 success=True,

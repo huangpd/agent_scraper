@@ -19,7 +19,15 @@ class TestNavigationStep:
     def test_serialization(self):
         step = NavigationStep(action="click", target="Files tab", description="点击文件标签")
         d = step.model_dump()
-        assert d == {"action": "click", "target": "Files tab", "value": "", "description": "点击文件标签"}
+        assert d == {"action": "click", "target": "Files tab", "value": "", "description": "点击文件标签", "extract_point": False}
+
+    def test_extract_point_default_false(self):
+        step = NavigationStep(action="goto", target="https://example.com")
+        assert step.extract_point is False
+
+    def test_extract_point_set_true(self):
+        step = NavigationStep(action="click", target="article", extract_point=True)
+        assert step.extract_point is True
 
     def test_missing_field_raises(self):
         with pytest.raises(Exception):
@@ -56,7 +64,7 @@ class TestPageRules:
         rules = PageRules()
         assert rules.load_more_selector is None
         assert rules.next_button_selector is None
-        assert rules.pagination_url is None
+        assert rules.pagination_max is None
         assert rules.sub_page_selector is None
         assert rules.sub_page_url_attr == "href"
         assert rules.sub_page_recursive is False

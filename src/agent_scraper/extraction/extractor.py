@@ -1,15 +1,17 @@
-import json
 import logging
 from html import unescape
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
-from agent_scraper.core.llm import LLMService
+from agent_scraper.core.llm import LLMService, get_strong_model_name
 from agent_scraper.core.models import ExtractionGoal
+from agent_scraper.extraction.css_engine import (
+    preprocess_html, validate_selectors_batch,
+    parse_json_response, CSS_SYSTEM_PROMPT,
+)
 from autoscraper.auto_scraper import AutoScraper
 from autoscraper.utils import normalize
-from agent_scraper.pipeline.prompts import SAMPLE_PROMPT, CSS_SELECTOR_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -17,42 +19,17 @@ logger = logging.getLogger(__name__)
 class Extractor:
     def __init__(self, llm_service: LLMService | None = None):
         self.llm_service = llm_service or LLMService()
-        self._css_rule_cache: list[dict] = []
+        self._css_rule_cache: dict = {}
         self._trained_scraper: AutoScraper | None = None
 
-    async def _llm_call(self, prompt: str) -> str:
-        resp = await self.client.chat.completions.create(
-            model=self.model,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp.choices[0].message.content.strip()
-
     def _clean_html(self, html: str) -> str:
-        """结构化清洗：剔除 JS、CSS、SVG 等干扰项，保留核心数据结构"""
+        """结构化清洗：复用 css_engine 去噪 + Unicode 标准化（供 AutoScraper 使用）"""
         if not html:
             return ""
-
-        # 预处理转义字符
         html = unescape(html)
-        soup = BeautifulSoup(html, "lxml")
-
-        # 1. 剔除完全无关的标签
-        # script: JS代码 | style: CSS样式 | svg: 图标代码 | canvas: 绘图
-        # meta/link: 元数据 | noscript: 无脚本备份
-        for tag in soup(["script", "style", "svg", "canvas", "meta", "link", "noscript"]):
-            tag.decompose()
-
-        # 2. 移除注释
-        from bs4 import Comment
-        for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
-            comment.extract()
-
-        # 3. 仅保留 body 内容（如果存在）
-        content = soup.body if soup.body else soup
-
-        # 4. 使用 autoscraper 官方规范化函数进一步处理
-        return normalize(str(content))
+        # max_chars=0: 不截断、不压缩列表（AutoScraper 需要完整数据）
+        cleaned = preprocess_html(html, max_chars=0)
+        return normalize(cleaned)
 
     async def extract(self, html: str, goal: ExtractionGoal) -> dict[str, list]:
         """优先使用 AutoScraper (ML)，只有失败时才用简单的 CSS LLM 兜底"""
@@ -90,7 +67,7 @@ class Extractor:
 
         if self._trained_scraper:
             # 同样使用规范化后的 HTML 进行提取
-            as_result = self._trained_scraper.get_result_similar(html=normalized_html, group_by_alias=True)
+            as_result = self._trained_scraper.get_result_similar(html=normalized_html, group_by_alias=True, unique=False)
             result_counts = {k: len(v) for k, v in as_result.items()}
             total = sum(result_counts.values())
             if total > 0:
@@ -99,9 +76,9 @@ class Extractor:
             else:
                 logger.warning("[Extractor] AutoScraper 提取结果为空，降级到 LLM CSS 选择器")
 
-        # 2. 简单 CSS 兜底（带缓存）
+        # 2. CSS 选择器兜底（强模型 + css_engine）
         logger.info("[Extractor] 策略: LLM CSS 选择器 (兜底)")
-        return await self._css_selector_extract(normalized_html, goal, expected_fields)
+        return await self._css_selector_extract(html, goal, expected_fields)
 
     # ── URL 字段 XPath 推导 ────────────────────────────────
 
@@ -206,20 +183,74 @@ class Extractor:
         return xpath + "/a/@href"
 
     async def _css_selector_extract(self, html: str, goal: ExtractionGoal, expected_fields: set[str]) -> dict:
-        soup = BeautifulSoup(normalize(unescape(html)), "lxml")
-        body = soup.body or soup
-        snippet = str(body)[:20000]
+        # 缓存命中：同一站点不同页面结构相同，直接复用上次的 selector
+        if self._css_rule_cache:
+            logger.info("[Extractor] 使用缓存的 CSS 选择器 (%d 个字段)", len(self._css_rule_cache))
+            result = self._apply_css_selectors(html, self._css_rule_cache)
+            result_counts = {k: len(v) for k, v in result.items()}
+            total = sum(result_counts.values())
+            if total > 0:
+                logger.info("[Extractor] CSS 缓存提取结果: %s", result_counts)
+                return result
+            logger.warning("[Extractor] CSS 缓存选择器在当前页无效，重新生成")
+            self._css_rule_cache = {}
+
+        snippet = preprocess_html(html)
         fields_desc = "\n".join(f"- {k}: {v}" for k, v in goal.fields.items())
-        prompt = CSS_SELECTOR_PROMPT.format(fields_desc=fields_desc, html_snippet=snippet)
+
+        prompt = (
+            "分析下面的 HTML，为每个字段生成 CSS 选择器来提取数据。\n\n"
+            f"要提取的字段：\n{fields_desc}\n\n"
+            f"HTML 片段：\n```html\n{snippet}\n```\n\n"
+            '输出格式（严格JSON，不要多余文字）：\n'
+            '{\n'
+            '  "字段名": {"selector": "CSS选择器", "attr": "text|href|src|其他属性"}\n'
+            '}'
+        )
+
         try:
-            content = await self.llm_service.call(prompt, caller="Extractor")
-            if "```" in content:
-                content = content.split("```")[1].replace("json", "").strip()
-            selectors = json.loads(content)
+            content = await self.llm_service.call(
+                prompt,
+                system_msg=CSS_SYSTEM_PROMPT,
+                caller="Extractor.CSS",
+                model=get_strong_model_name(),
+            )
+            selectors = parse_json_response(content)
             logger.info("[Extractor] LLM 生成 CSS 选择器:")
             for field, info in selectors.items():
                 logger.info("[Extractor]   %s → selector='%s', attr='%s'",
                             field, info.get("selector", "?"), info.get("attr", "text"))
+
+            # OutputGuard 校验：语法 + 嵌套深度 + 匹配数量边界
+            from agent_scraper.pipeline.output_guard import validate_css_selectors
+            validated = validate_css_selectors(selectors, html)
+            invalid = [k for k in selectors if k not in validated]
+            selectors = validated
+            if invalid:
+                logger.warning("[Extractor] CSS 选择器无效: %s，重试一轮", invalid)
+                retry_fields = {k: v for k, v in goal.fields.items() if k in invalid}
+                retry_desc = "\n".join(f"- {k}: {v}" for k, v in retry_fields.items())
+                retry_prompt = (
+                    "上一轮为以下字段生成的 CSS 选择器无法匹配任何元素，请重新分析：\n\n"
+                    f"字段：\n{retry_desc}\n\n"
+                    f"HTML 片段：\n```html\n{snippet}\n```\n\n"
+                    '输出格式（严格JSON，不要多余文字）：\n'
+                    '{\n'
+                    '  "字段名": {"selector": "CSS选择器", "attr": "text|href|src|其他属性"}\n'
+                    '}'
+                )
+                retry_content = await self.llm_service.call(
+                    retry_prompt,
+                    system_msg=CSS_SYSTEM_PROMPT,
+                    caller="Extractor.CSS.retry",
+                    model=get_strong_model_name(),
+                )
+                retry_selectors = parse_json_response(retry_content)
+                selectors.update(retry_selectors)
+
+            # 缓存有效的 selector，后续页面直接复用
+            self._css_rule_cache = selectors
+
             result = self._apply_css_selectors(html, selectors)
             result_counts = {k: len(v) for k, v in result.items()}
             logger.info("[Extractor] CSS 选择器提取结果: %s", result_counts)
@@ -235,7 +266,10 @@ class Extractor:
         for field, info in selectors.items():
             sel = info.get("selector")
             attr = info.get("attr", "text")
-            nodes = soup.select(sel)
+            try:
+                nodes = soup.select(sel)
+            except Exception:
+                nodes = []
             vals = []
             for n in nodes:
                 val = n.get_text(strip=True) if attr == "text" else n.get(attr, "")

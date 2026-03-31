@@ -9,6 +9,7 @@ class NavigationStep(BaseModel):
     target: str = ""     # URL / 按钮文本 / CSS选择器（wait 时可为空）
     value: str = ""      # input 动作的输入值（账号、密码等）
     description: str = ""  # 原始自然语言描述
+    extract_point: bool = False  # 多实体模式：在此步骤后缓存页面 HTML 用于提取
 
 
 class ExtractionGoal(BaseModel):
@@ -18,7 +19,7 @@ class ExtractionGoal(BaseModel):
     url_pattern: str | None = None  # 可选URL构造模板
     samples: dict[str, list[str]] | None = None  # 用户提供的样本数据
     # 用户指定的遍历模式，空=只提取当前页
-    # 可选值: "load_more" | "pagination" | "sub_pages" | "next_button"
+    # 可选值: "load_more" | "sub_pages" | "next_button"
     traversal_hints: list[str] = []
     max_pages: int | None = None  # 用户指定的最大页数（如"翻到第3页停止"→3）
     load_more_text: str | None = None  # 用户指定的加载按钮文本（如 "Load more files"、"more>>"）
@@ -27,11 +28,10 @@ class ExtractionGoal(BaseModel):
 
 class PageRules(BaseModel):
     """LLM 发现的页面遍历规则 — AI 只产出规则，代码执行"""
-    # 四种翻页模式，可叠加
+    # 三种翻页模式，可叠加
     load_more_selector: str | None = None     # CSS 选择器（LLM 发现）
     next_button_selector: str | None = None   # "a.pagination-next"
-    pagination_url: str | None = None         # "https://xxx/page/{n}"
-    pagination_max: int | None = None         # 最大页数
+    pagination_max: int | None = None         # 最大页数（next_button 使用）
     sub_page_selector: str | None = None      # "a.folder-link" 子页面入口
     sub_page_url_attr: str = "href"           # 从哪个属性取URL
     sub_page_url_filter: str | None = None    # URL 过滤关键词，如 "/tree/" 只保留含此的URL
@@ -42,7 +42,6 @@ class PageRules(BaseModel):
         return any([
             self.load_more_selector,
             self.next_button_selector,
-            self.pagination_url,
             self.sub_page_selector
         ])
 
